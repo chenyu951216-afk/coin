@@ -11,6 +11,7 @@ from . import strategies as strategies_module
 from .backtest import BacktestConfig, run_backtest
 from .config import Settings
 from .features import build_feature_frame
+from .history_policy import normalize_backtest_window
 from .providers import BitgetPublicClient, CoinGlassClient
 from .reporting import save_report
 from .strategies import STRATEGIES
@@ -33,7 +34,7 @@ def _resolved_coinglass_symbol(s: Settings) -> str:
     )
 
 
-def fetch_and_build(s: Settings):
+def fetch_and_build(s: Settings, *, start: str, end: str):
     cg_symbol = _resolved_coinglass_symbol(s)
     cg = CoinGlassClient(s.coinglass_api_key)
     bg = BitgetPublicClient(base_url=s.bitget_rest_base_url)
@@ -41,11 +42,11 @@ def fetch_and_build(s: Settings):
         exchange=s.coinglass_exchange,
         symbol=cg_symbol,
         interval=s.timeframe,
-        start=s.start,
-        end=s.end,
+        start=start,
+        end=end,
     )
     granularity = s.timeframe.replace("h", "H") if s.timeframe.endswith("h") else s.timeframe
-    price = bg.candles(s.symbol, granularity, s.start, s.end)
+    price = bg.candles(s.symbol, granularity, start, end)
     if price.empty:
         raise RuntimeError("Bitget returned no price candles; aborting rather than producing fake metrics.")
     datasets = {
@@ -82,13 +83,24 @@ def fetch_and_build(s: Settings):
             f"MIN_ALIGNED_COVERAGE={s.min_aligned_coverage:.0%}. Raw rows={stats}. "
             "Aborting instead of backtesting an incomplete intersection; shorten/change the research range or source."
         )
-    funding_events = bg.funding_history(s.symbol, s.start, s.end)
+    funding_events = bg.funding_history(s.symbol, start, end)
     return features, funding_events, stats
 
 
 def command_backtest(args):
     s = Settings()
-    df, funding_events, source_stats = fetch_and_build(s)
+    window = normalize_backtest_window(
+        timeframe=s.timeframe,
+        requested_start=s.start,
+        requested_end=s.end,
+    )
+    if window.adjusted:
+        print(f"[CoinGlass Standard history policy] {window.message}")
+    df, funding_events, source_stats = fetch_and_build(
+        s,
+        start=window.used_start,
+        end=window.used_end,
+    )
     if len(df) < 500:
         raise RuntimeError(f"Only {len(df)} aligned rows. Refusing to treat this as a meaningful backtest.")
     cfg = BacktestConfig(
@@ -97,8 +109,14 @@ def command_backtest(args):
         fee_bps=s.taker_fee_bps,
         slippage_bps=s.slippage_bps,
     )
-    results = {name: run_backtest(df, fn, cfg, funding_events=funding_events) for name, fn in STRATEGIES.items()}
-    validation = {name: evaluate_oos(df, fn, cfg, funding_events=funding_events) for name, fn in STRATEGIES.items()}
+    results = {
+        name: run_backtest(df, fn, cfg, funding_events=funding_events)
+        for name, fn in STRATEGIES.items()
+    }
+    validation = {
+        name: evaluate_oos(df, fn, cfg, funding_events=funding_events)
+        for name, fn in STRATEGIES.items()
+    }
     meta = {
         "symbol": s.symbol,
         "coinglass_symbol": source_stats["resolved_coinglass_symbol"],
@@ -107,6 +125,11 @@ def command_backtest(args):
         "timeframe": s.timeframe,
         "requested_start": s.start,
         "requested_end": s.end,
+        "used_start": window.used_start,
+        "used_end": window.used_end,
+        "history_window_adjusted": window.adjusted,
+        "history_adjustment_reason": window.adjustment_reason,
+        "coinglass_standard_max_history_days": window.max_history_days,
         "initial_equity": s.initial_equity,
         "risk_per_trade": s.risk_per_trade,
         "taker_fee_bps": s.taker_fee_bps,
@@ -121,7 +144,13 @@ def command_backtest(args):
             "features_py_sha256": _module_sha256(features_module),
         },
     }
-    report = save_report(args.out, metadata=meta, features=df, results=results, validation=validation)
+    report = save_report(
+        args.out,
+        metadata=meta,
+        features=df,
+        results=results,
+        validation=validation,
+    )
     print(report.read_text(encoding="utf-8"))
 
 
