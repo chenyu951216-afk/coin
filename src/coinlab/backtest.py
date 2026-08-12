@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import math
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 
+from .signal_quality import cost_aware_breakeven_trigger, estimated_round_trip_cost_r, signal_snapshot
 from .strategies import StrategySignal
 
 
@@ -18,6 +19,11 @@ class BacktestConfig:
     slippage_bps: float = 2.0
     max_holding_bars: int = 48
     ambiguous_policy: str = "stop_first"
+    # Development evidence on both ETH 15m and 30m showed that setups whose
+    # estimated round-trip execution cost consumes a large part of initial R
+    # are structurally fragile. This is a pre-trade economics gate, not an
+    # outcome/date/symbol filter.
+    max_estimated_cost_r: float = 0.18
 
 
 @dataclass
@@ -38,6 +44,7 @@ class Trade:
     stop_pct: float
     target_pct: float
     planned_reward_r: float
+    estimated_cost_r: float
     size: float
     entry_notional: float
     risk_budget_usdt: float
@@ -60,6 +67,10 @@ class Trade:
     mfe_r: float
     mae_r: float
     holding_bars: int
+    # Only values available on the completed signal bar. This lets future
+    # research diagnose reusable conditions without reconstructing or peeking
+    # at anything after the entry decision.
+    signal_features: dict[str, Any]
 
 
 def _fill_entry(open_price: float, direction: int, slippage_bps: float) -> float:
@@ -98,6 +109,8 @@ def run_backtest(
     trades: list[Trade] = []
     i = 0
     n = len(df)
+    signals_seen = 0
+    signals_rejected_cost = 0
 
     while i < n - 1:
         signal_row = df.iloc[i]
@@ -105,6 +118,7 @@ def run_backtest(
         if signal.direction == 0 or not np.isfinite(signal_row.get("atr14", np.nan)):
             i += 1
             continue
+        signals_seen += 1
 
         # STRICT NO-LOOKAHEAD: signal is known only after close[i]; entry is open[i+1].
         entry_i = i + 1
@@ -133,6 +147,20 @@ def run_backtest(
         if stop_distance <= 0 or not math.isfinite(stop_distance):
             i += 1
             continue
+
+        # Pre-trade cost gate: if realistic two-sided fee+slippage is already too
+        # large relative to 1R, the setup does not have enough economic room.
+        estimated_cost_r = estimated_round_trip_cost_r(
+            entry=entry,
+            stop=initial_stop,
+            fee_bps=cfg.fee_bps,
+            slippage_bps=cfg.slippage_bps,
+        )
+        if cfg.max_estimated_cost_r > 0 and estimated_cost_r > cfg.max_estimated_cost_r:
+            signals_rejected_cost += 1
+            i += 1
+            continue
+
         target = entry + signal.direction * stop_distance * signal.reward_r
 
         equity_before = equity
@@ -181,7 +209,16 @@ def run_backtest(
             atr_now = float(bar.atr14) if np.isfinite(bar.atr14) else atr
             favorable_close = (close_now - entry) * signal.direction
             if favorable_close >= stop_distance:
-                current_stop = max(current_stop, entry) if signal.direction > 0 else min(current_stop, entry)
+                # Keep the original 1R activation timing, but move to a fee/slippage
+                # aware breakeven trigger instead of raw entry, so a "breakeven"
+                # stop is not systematically a net loser after costs.
+                be_trigger = cost_aware_breakeven_trigger(
+                    entry_fill=entry,
+                    direction=signal.direction,
+                    fee_bps=cfg.fee_bps,
+                    slippage_bps=cfg.slippage_bps,
+                )
+                current_stop = max(current_stop, be_trigger) if signal.direction > 0 else min(current_stop, be_trigger)
                 breakeven_activated = True
             if favorable_close >= 1.5 * stop_distance:
                 trail = close_now - signal.direction * 1.2 * atr_now
@@ -229,6 +266,7 @@ def run_backtest(
             stop_pct=abs(entry - initial_stop) / entry if entry else np.nan,
             target_pct=abs(target - entry) / entry if entry else np.nan,
             planned_reward_r=signal.reward_r,
+            estimated_cost_r=estimated_cost_r,
             size=size,
             entry_notional=entry_notional,
             risk_budget_usdt=risk_budget,
@@ -251,6 +289,7 @@ def run_backtest(
             mfe_r=max_favorable / stop_distance if stop_distance else np.nan,
             mae_r=max_adverse / stop_distance if stop_distance else np.nan,
             holding_bars=int(exit_i - entry_i + 1),
+            signal_features=signal_snapshot(signal_row),
         ))
 
         # One position per strategy. Resume only after this position is closed.
@@ -260,6 +299,10 @@ def run_backtest(
     metrics = compute_metrics(trades_df, cfg.initial_equity)
     metrics["final_equity"] = float(equity)
     metrics["ambiguous_exit_count"] = int(trades_df["ambiguous_exit"].sum()) if not trades_df.empty else 0
+    metrics["signals_seen"] = int(signals_seen)
+    metrics["signals_rejected_cost"] = int(signals_rejected_cost)
+    metrics["cost_rejection_rate"] = float(signals_rejected_cost / signals_seen) if signals_seen else None
+    metrics["max_estimated_cost_r"] = float(cfg.max_estimated_cost_r)
     return trades_df, metrics
 
 
@@ -284,6 +327,11 @@ def compute_metrics(trades: pd.DataFrame, initial_equity: float) -> dict:
             "avg_win_r": None,
             "avg_loss_r": None,
             "max_consecutive_losses": 0,
+            "avg_mfe_r": None,
+            "avg_mae_r": None,
+            "median_holding_bars": None,
+            "breakeven_activation_rate": None,
+            "trailing_activation_rate": None,
         }
 
     pnl = trades["net_pnl"].astype(float)
