@@ -29,6 +29,10 @@ class Settings:
     risk_per_trade: float = float(os.getenv("RISK_PER_TRADE", "0.01"))
     taker_fee_bps: float = float(os.getenv("TAKER_FEE_BPS", "6"))
     slippage_bps: float = float(os.getenv("SLIPPAGE_BPS", "2"))
+    # Reject a setup before entry when realistic round-trip fee+slippage would
+    # consume too much of 1R. This is derived from execution economics, not a
+    # fixed price stop or historical outcome exception.
+    max_estimated_cost_r: float = float(os.getenv("MAX_ESTIMATED_COST_R", "0.18"))
     min_aligned_coverage: float = float(os.getenv("MIN_ALIGNED_COVERAGE", "0.90"))
 
     # Bitget execution mechanics only. These values never derive strategy entry/SL/TP.
