@@ -14,25 +14,24 @@ def _bool(name: str, default: str = "false") -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    # CoinGlass research data. AUTO maps a Bitget public symbol to CoinGlass'
-    # current instrument id for the selected exchange (for example *_UMCBL).
+    # CoinGlass research data.
     coinglass_api_key: str = os.getenv("COINGLASS_API_KEY", "")
     coinglass_exchange: str = os.getenv("COINGLASS_EXCHANGE", "Bitget")
     coinglass_symbol: str = os.getenv("COINGLASS_SYMBOL", "AUTO")
 
-    # Selected Bitget contract for a single-symbol backtest.
+    # Single-symbol research defaults. Web UI always normalizes dates to the
+    # maximum safe CoinGlass Standard window for the selected timeframe.
     symbol: str = os.getenv("SYMBOL", "ETHUSDT").upper()
     timeframe: str = os.getenv("TIMEFRAME", "15m")
-    start: str = os.getenv("START", "2025-01-01T00:00:00Z")
-    end: str = os.getenv("END", "2026-01-01T00:00:00Z")
+    start: str = os.getenv("START", "")
+    end: str = os.getenv("END", "")
     initial_equity: float = float(os.getenv("INITIAL_EQUITY", "10000"))
     risk_per_trade: float = float(os.getenv("RISK_PER_TRADE", "0.01"))
     taker_fee_bps: float = float(os.getenv("TAKER_FEE_BPS", "6"))
     slippage_bps: float = float(os.getenv("SLIPPAGE_BPS", "2"))
     min_aligned_coverage: float = float(os.getenv("MIN_ALIGNED_COVERAGE", "0.90"))
 
-    # Bitget exchange layer. These values control execution mechanics only;
-    # they never alter strategy entry/stop/take-profit levels.
+    # Bitget execution mechanics only. These values never derive strategy entry/SL/TP.
     bitget_rest_base_url: str = os.getenv("BITGET_REST_BASE_URL", "https://api.bitget.com")
     bitget_api_key: str = os.getenv("BITGET_API_KEY", "")
     bitget_api_secret: str = os.getenv("BITGET_API_SECRET", "")
@@ -53,11 +52,14 @@ class Settings:
     )
     live_trading_enabled: bool = _bool("LIVE_TRADING_ENABLED", "false")
 
-    # Whole-market scanner. Bitget public liquidity is filtered first; only
-    # survivors consume CoinGlass Standard history requests.
+    # Continuous whole-market scanner. It runs once per newly completed scan
+    # timeframe candle, not in a wasteful tight loop.
     scan_timeframe: str = os.getenv("SCAN_TIMEFRAME", "15m")
     scan_lookback_bars: int = int(os.getenv("SCAN_LOOKBACK_BARS", "180"))
     scan_min_aligned_rows: int = int(os.getenv("SCAN_MIN_ALIGNED_ROWS", "110"))
     scan_min_turnover_usdt: float = float(os.getenv("SCAN_MIN_TURNOVER_USDT", "1000000"))
     scan_max_spread_pct: float = float(os.getenv("SCAN_MAX_SPREAD_PCT", "0.50"))
     scan_max_symbols: int = int(os.getenv("SCAN_MAX_SYMBOLS", "0"))
+    scan_auto_start: bool = _bool("SCAN_AUTO_START", "true")
+    scan_grace_seconds: int = int(os.getenv("SCAN_GRACE_SECONDS", "8"))
+    scan_error_retry_seconds: int = int(os.getenv("SCAN_ERROR_RETRY_SECONDS", "120"))

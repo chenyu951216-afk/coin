@@ -19,6 +19,10 @@ from .universe import resolve_coinglass_instrument
 from .validation import evaluate_oos
 
 
+def _stage(name: str, message: str) -> None:
+    print(f"COINLAB_STAGE:{name}:{message}", flush=True)
+
+
 def _module_sha256(module) -> str:
     return hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
 
@@ -27,11 +31,8 @@ def _resolved_coinglass_symbol(s: Settings) -> str:
     configured = str(s.coinglass_symbol or "").strip()
     if configured and configured.upper() != "AUTO":
         return configured
-    return resolve_coinglass_instrument(
-        s.coinglass_api_key,
-        s.coinglass_exchange,
-        s.symbol,
-    )
+    _stage("symbol", "正在確認 CoinGlass 與 Bitget 的商品對應")
+    return resolve_coinglass_instrument(s.coinglass_api_key, s.coinglass_exchange, s.symbol)
 
 
 def fetch_and_build(s: Settings, *, start: str, end: str):
@@ -46,9 +47,13 @@ def fetch_and_build(s: Settings, *, start: str, end: str):
         end=end,
     )
     granularity = s.timeframe.replace("h", "H") if s.timeframe.endswith("h") else s.timeframe
+
+    _stage("bitget", "正在下載 Bitget 已完成 K 線")
     price = bg.candles(s.symbol, granularity, start, end)
     if price.empty:
         raise RuntimeError("Bitget returned no price candles; aborting rather than producing fake metrics.")
+
+    _stage("coinglass", "正在下載 CoinGlass OI / Funding / 清算 / 多空比 / Taker / Orderbook")
     datasets = {
         "oi": cg.open_interest(**common),
         "funding": cg.funding(**common),
@@ -60,6 +65,8 @@ def fetch_and_build(s: Settings, *, start: str, end: str):
     missing = [k for k, v in datasets.items() if v.empty]
     if missing:
         raise RuntimeError(f"CoinGlass returned empty required datasets: {missing}. Backtest aborted for integrity.")
+
+    _stage("align", "正在依時間戳精確對齊所有資料，缺資料不向未來補值")
     features = build_feature_frame(
         price,
         datasets["oi"],
@@ -83,40 +90,43 @@ def fetch_and_build(s: Settings, *, start: str, end: str):
             f"MIN_ALIGNED_COVERAGE={s.min_aligned_coverage:.0%}. Raw rows={stats}. "
             "Aborting instead of backtesting an incomplete intersection; shorten/change the research range or source."
         )
+
+    _stage("funding", "正在下載 Bitget 歷史資金費率並依結算時間加入損益")
     funding_events = bg.funding_history(s.symbol, start, end)
     return features, funding_events, stats
 
 
 def command_backtest(args):
     s = Settings()
+    _stage("prepare", "正在建立 CoinGlass Standard 可用的最大安全回測區間")
     window = normalize_backtest_window(
         timeframe=s.timeframe,
-        requested_start=s.start,
-        requested_end=s.end,
+        requested_start=s.start or None,
+        requested_end=s.end or None,
     )
-    if window.adjusted:
-        print(f"[CoinGlass Standard history policy] {window.message}")
-    df, funding_events, source_stats = fetch_and_build(
-        s,
-        start=window.used_start,
-        end=window.used_end,
-    )
+    df, funding_events, source_stats = fetch_and_build(s, start=window.used_start, end=window.used_end)
     if len(df) < 500:
         raise RuntimeError(f"Only {len(df)} aligned rows. Refusing to treat this as a meaningful backtest.")
+
     cfg = BacktestConfig(
         initial_equity=s.initial_equity,
         risk_per_trade=s.risk_per_trade,
         fee_bps=s.taker_fee_bps,
         slippage_bps=s.slippage_bps,
     )
+
+    _stage("backtest", "正在逐根 K 線回放六套策略；訊號收 K 後成立，下一根才允許成交")
     results = {
         name: run_backtest(df, fn, cfg, funding_events=funding_events)
         for name, fn in STRATEGIES.items()
     }
+
+    _stage("validation", "正在執行 60/20/20 與 Walk-forward 樣本外驗證")
     validation = {
         name: evaluate_oos(df, fn, cfg, funding_events=funding_events)
         for name, fn in STRATEGIES.items()
     }
+
     meta = {
         "symbol": s.symbol,
         "coinglass_symbol": source_stats["resolved_coinglass_symbol"],
@@ -144,6 +154,8 @@ def command_backtest(args):
             "features_py_sha256": _module_sha256(features_module),
         },
     }
+
+    _stage("report", "正在建立逐筆交易、策略統計與可複製報告")
     report = save_report(
         args.out,
         metadata=meta,
@@ -151,7 +163,7 @@ def command_backtest(args):
         results=results,
         validation=validation,
     )
-    print(report.read_text(encoding="utf-8"))
+    _stage("complete", f"回測完成，報告已建立：{report}")
 
 
 def command_validate(args):
