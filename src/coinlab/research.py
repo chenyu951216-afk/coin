@@ -21,8 +21,12 @@ STRATEGY_SOURCE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "liquidation_reversal": ("liq", "taker"),
     "funding_crowding": ("funding", "ls", "taker"),
     "taker_flow_momentum": ("oi", "funding", "taker"),
-    "orderbook_pressure": ("oi", "orderbook"),
-    "oi_divergence": ("oi", "funding", "taker"),
+    # Resting orderbook liquidity is noisy/spoofable, so executed taker flow is
+    # now a required confirmation source rather than treating the book alone as edge.
+    "orderbook_pressure": ("oi", "orderbook", "taker"),
+    # OI contraction reversal now requires liquidation evidence before the
+    # strategy is allowed to fade the prior move.
+    "oi_divergence": ("oi", "funding", "taker", "liq"),
 }
 
 
