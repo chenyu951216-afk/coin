@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
 
@@ -22,17 +22,54 @@ def _utc_ms(value: str | pd.Timestamp) -> int:
     return int(ts.timestamp() * 1000)
 
 
+def _interval_ms(interval: str) -> int:
+    units = {
+        "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+        "1h": 3_600_000, "4h": 14_400_000, "6h": 21_600_000, "8h": 28_800_000,
+        "12h": 43_200_000, "1d": 86_400_000, "1w": 604_800_000,
+    }
+    if interval not in units:
+        raise ValueError(f"Unsupported CoinGlass interval: {interval}")
+    return units[interval]
+
+
 @dataclass
 class CoinGlassClient:
     api_key: str
     base_url: str = "https://open-api-v4.coinglass.com"
     timeout: float = 30.0
+    _last_request_at: float = field(default=0.0, init=False, repr=False)
+    _max_per_minute: int | None = field(default=None, init=False, repr=False)
+
+    def _pace(self) -> None:
+        if not self._max_per_minute:
+            return
+        minimum_gap = 60.0 / max(self._max_per_minute, 1) + 0.03
+        remaining = minimum_gap - (time.monotonic() - self._last_request_at)
+        if remaining > 0:
+            time.sleep(remaining)
 
     def _get(self, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         if not self.api_key:
             raise RuntimeError("COINGLASS_API_KEY is required. Refusing to invent backtest data.")
         with httpx.Client(timeout=self.timeout) as client:
-            r = client.get(self.base_url + path, params=params, headers={"CG-API-KEY": self.api_key})
+            for attempt in range(4):
+                self._pace()
+                r = client.get(self.base_url + path, params=params, headers={"CG-API-KEY": self.api_key})
+                self._last_request_at = time.monotonic()
+                try:
+                    header_limit = int(r.headers.get("API-KEY-MAX-LIMIT", "0"))
+                    if header_limit > 0:
+                        self._max_per_minute = header_limit
+                except ValueError:
+                    pass
+                if r.status_code != 429:
+                    break
+                if attempt == 3:
+                    r.raise_for_status()
+                used = int(r.headers.get("API-KEY-USE-LIMIT", "0") or 0)
+                wait = 61.0 if self._max_per_minute and used >= self._max_per_minute else max(2.0, 60.0 / max(self._max_per_minute or 30, 1))
+                time.sleep(wait)
             r.raise_for_status()
             payload = r.json()
         if str(payload.get("code")) != "0":
@@ -54,34 +91,32 @@ class CoinGlassClient:
         extra: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
         start_ms, end_ms = _utc_ms(start), _utc_ms(end)
-        cursor_end = end_ms
+        if end_ms <= start_ms:
+            raise ValueError("end must be after start")
+        # Bounded chunks stay below CoinGlass' 1000-row maximum so long histories
+        # cannot be silently truncated because of endpoint sort direction.
+        bar_ms = _interval_ms(interval)
+        max_bars_per_chunk = 900
+        cursor = start_ms
         rows: list[dict[str, Any]] = []
         seen: set[int] = set()
-        while cursor_end > start_ms:
+        while cursor <= end_ms:
+            chunk_end = min(end_ms, cursor + bar_ms * (max_bars_per_chunk - 1))
             params: dict[str, Any] = {
-                "exchange": exchange,
-                "symbol": symbol,
-                "interval": interval,
-                "limit": 1000,
-                "start_time": start_ms,
-                "end_time": cursor_end,
+                "exchange": exchange, "symbol": symbol, "interval": interval, "limit": 1000,
+                "start_time": cursor, "end_time": chunk_end,
             }
             if extra:
                 params.update(extra)
             batch = self._get(path, params)
-            if not batch:
-                break
-            times = []
+            if len(batch) >= 1000:
+                raise RuntimeError(f"CoinGlass chunk unexpectedly hit 1000-row ceiling for {path}; aborting to avoid truncated backtest data.")
             for row in batch:
                 t = int(row["time"])
-                times.append(t)
-                if start_ms <= t <= end_ms and t not in seen:
+                if cursor <= t <= chunk_end and t not in seen:
                     rows.append(row)
                     seen.add(t)
-            oldest = min(times)
-            if oldest <= start_ms or oldest >= cursor_end:
-                break
-            cursor_end = oldest - 1
+            cursor = chunk_end + 1
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows).sort_values("time").drop_duplicates("time")
