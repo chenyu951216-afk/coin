@@ -22,10 +22,11 @@ _SKIP_PATHS = {"/", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 for route in v4.app.router.routes:
     if getattr(route, "path", None) not in _SKIP_PATHS:
         app.router.routes.append(route)
-for handler in v4.app.router.on_startup:
-    app.add_event_handler("startup", handler)
-for handler in v4.app.router.on_shutdown:
-    app.add_event_handler("shutdown", handler)
+# FastAPI/Starlette versions in this project expose startup/shutdown handlers on
+# the router. Copy the tested v0.4 handlers directly rather than relying on the
+# removed app.add_event_handler compatibility API.
+app.router.on_startup.extend(v4.app.router.on_startup)
+app.router.on_shutdown.extend(v4.app.router.on_shutdown)
 
 
 _old_button = '<button id="copyReportBtn" class="hidden" style="margin-top:9px" onclick="copyReport()">複製完整回測報告給 ChatGPT</button>'
