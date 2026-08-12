@@ -20,6 +20,7 @@ class Settings:
     risk_per_trade: float = float(os.getenv("RISK_PER_TRADE", "0.01"))
     taker_fee_bps: float = float(os.getenv("TAKER_FEE_BPS", "6"))
     slippage_bps: float = float(os.getenv("SLIPPAGE_BPS", "2"))
+    min_aligned_coverage: float = float(os.getenv("MIN_ALIGNED_COVERAGE", "0.90"))
     bitget_api_key: str = os.getenv("BITGET_API_KEY", "")
     bitget_api_secret: str = os.getenv("BITGET_API_SECRET", "")
     bitget_api_passphrase: str = os.getenv("BITGET_API_PASSPHRASE", "")
