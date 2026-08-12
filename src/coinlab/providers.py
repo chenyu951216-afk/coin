@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,12 +26,31 @@ def _utc_ms(value: str | pd.Timestamp) -> int:
 def _interval_ms(interval: str) -> int:
     units = {
         "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
-        "1h": 3_600_000, "4h": 14_400_000, "6h": 21_600_000, "8h": 28_800_000,
-        "12h": 43_200_000, "1d": 86_400_000, "1w": 604_800_000,
+        "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000,
+        "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000, "1w": 604_800_000,
     }
     if interval not in units:
         raise ValueError(f"Unsupported CoinGlass interval: {interval}")
     return units[interval]
+
+
+class CoinGlassAPIError(RuntimeError):
+    def __init__(self, path: str, code: str, message: str, payload: dict[str, Any] | None = None):
+        self.path = path
+        self.code = str(code)
+        self.message = str(message)
+        self.payload = payload or {}
+        super().__init__(f"CoinGlass {path} error {self.code}: {self.message}")
+
+    @property
+    def earliest_allowed_start_ms(self) -> int | None:
+        match = re.search(r"earliest allowed start_time is\s*(\d+)", self.message, flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
 
 
 @dataclass
@@ -53,30 +73,50 @@ class CoinGlassClient:
         if not self.api_key:
             raise RuntimeError("COINGLASS_API_KEY is required. Refusing to invent backtest data.")
         with httpx.Client(timeout=self.timeout) as client:
+            response: httpx.Response | None = None
             for attempt in range(4):
                 self._pace()
-                r = client.get(self.base_url + path, params=params, headers={"CG-API-KEY": self.api_key})
+                response = client.get(self.base_url + path, params=params, headers={"CG-API-KEY": self.api_key})
                 self._last_request_at = time.monotonic()
                 try:
-                    header_limit = int(r.headers.get("API-KEY-MAX-LIMIT", "0"))
+                    header_limit = int(response.headers.get("API-KEY-MAX-LIMIT", "0"))
                     if header_limit > 0:
                         self._max_per_minute = header_limit
                 except ValueError:
                     pass
-                if r.status_code != 429:
+                if response.status_code != 429:
                     break
                 if attempt == 3:
-                    r.raise_for_status()
-                used = int(r.headers.get("API-KEY-USE-LIMIT", "0") or 0)
+                    break
+                try:
+                    used = int(response.headers.get("API-KEY-USE-LIMIT", "0") or 0)
+                except ValueError:
+                    used = 0
                 wait = 61.0 if self._max_per_minute and used >= self._max_per_minute else max(2.0, 60.0 / max(self._max_per_minute or 30, 1))
                 time.sleep(wait)
-            r.raise_for_status()
-            payload = r.json()
+            assert response is not None
+            try:
+                payload = response.json()
+            except Exception:
+                response.raise_for_status()
+                raise RuntimeError(f"CoinGlass returned a non-JSON response for {path}")
+
+        if response.status_code >= 400:
+            if isinstance(payload, dict):
+                raise CoinGlassAPIError(
+                    path,
+                    str(payload.get("code", response.status_code)),
+                    str(payload.get("msg") or payload.get("message") or response.reason_phrase),
+                    payload,
+                )
+            response.raise_for_status()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Unexpected CoinGlass response shape for {path}")
         if str(payload.get("code")) != "0":
-            raise RuntimeError(f"CoinGlass error: {payload}")
+            raise CoinGlassAPIError(path, str(payload.get("code")), str(payload.get("msg") or payload.get("message") or "unknown error"), payload)
         data = payload.get("data", [])
         if not isinstance(data, list):
-            raise RuntimeError(f"Unexpected CoinGlass response shape for {path}")
+            raise RuntimeError(f"Unexpected CoinGlass data shape for {path}")
         return data
 
     def history(
@@ -90,16 +130,16 @@ class CoinGlassClient:
         end: str,
         extra: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
-        start_ms, end_ms = _utc_ms(start), _utc_ms(end)
-        if end_ms <= start_ms:
+        requested_start_ms, end_ms = _utc_ms(start), _utc_ms(end)
+        if end_ms <= requested_start_ms:
             raise ValueError("end must be after start")
-        # Bounded chunks stay below CoinGlass' 1000-row maximum so long histories
-        # cannot be silently truncated because of endpoint sort direction.
         bar_ms = _interval_ms(interval)
         max_bars_per_chunk = 900
-        cursor = start_ms
+        cursor = requested_start_ms
         rows: list[dict[str, Any]] = []
         seen: set[int] = set()
+        api_adjusted_start_ms: int | None = None
+
         while cursor <= end_ms:
             chunk_end = min(end_ms, cursor + bar_ms * (max_bars_per_chunk - 1))
             params: dict[str, Any] = {
@@ -108,20 +148,45 @@ class CoinGlassClient:
             }
             if extra:
                 params.update(extra)
-            batch = self._get(path, params)
+            try:
+                batch = self._get(path, params)
+            except CoinGlassAPIError as exc:
+                earliest = exc.earliest_allowed_start_ms
+                if earliest is None or earliest > end_ms:
+                    if earliest is not None and earliest > end_ms:
+                        empty = pd.DataFrame()
+                        empty.attrs.update({"path": path, "requested_start_ms": requested_start_ms, "api_adjusted_start_ms": earliest})
+                        return empty
+                    raise
+                aligned = ((earliest + bar_ms - 1) // bar_ms) * bar_ms
+                if aligned <= cursor:
+                    raise
+                api_adjusted_start_ms = max(api_adjusted_start_ms or aligned, aligned)
+                cursor = aligned
+                continue
             if len(batch) >= 1000:
                 raise RuntimeError(f"CoinGlass chunk unexpectedly hit 1000-row ceiling for {path}; aborting to avoid truncated backtest data.")
             for row in batch:
-                t = int(row["time"])
-                if cursor <= t <= chunk_end and t not in seen:
+                if not isinstance(row, dict) or "time" not in row:
+                    continue
+                try:
+                    timestamp = int(row["time"])
+                except (TypeError, ValueError):
+                    continue
+                if cursor <= timestamp <= chunk_end and timestamp not in seen:
                     rows.append(row)
-                    seen.add(t)
+                    seen.add(timestamp)
             cursor = chunk_end + 1
+
         if not rows:
-            return pd.DataFrame()
+            empty = pd.DataFrame()
+            empty.attrs.update({"path": path, "requested_start_ms": requested_start_ms, "api_adjusted_start_ms": api_adjusted_start_ms})
+            return empty
         df = pd.DataFrame(rows).sort_values("time").drop_duplicates("time")
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-        return df.set_index("time")
+        df = df.set_index("time")
+        df.attrs.update({"path": path, "requested_start_ms": requested_start_ms, "api_adjusted_start_ms": api_adjusted_start_ms})
+        return df
 
     def open_interest(self, **kwargs: Any) -> pd.DataFrame:
         return self.history("/api/futures/open-interest/history", **kwargs)
@@ -154,13 +219,7 @@ class BitgetPublicClient:
         rows: dict[int, list[str]] = {}
         with httpx.Client(timeout=self.timeout) as client:
             while cursor > start_ms:
-                params = {
-                    "symbol": symbol,
-                    "granularity": granularity,
-                    "productType": product_type,
-                    "endTime": cursor,
-                    "limit": 200,
-                }
+                params = {"symbol": symbol, "granularity": granularity, "productType": product_type, "endTime": cursor, "limit": 200}
                 r = client.get(self.base_url + "/api/v2/mix/market/history-candles", params=params)
                 r.raise_for_status()
                 payload = r.json()
@@ -231,29 +290,13 @@ class BitgetTradeClient:
         body_text = json.dumps(body or {}, separators=(",", ":"), ensure_ascii=False) if body else ""
         prehash = ts + method.upper() + path + (("?" + query) if query else "") + body_text
         sig = base64.b64encode(hmac.new(self.api_secret.encode(), prehash.encode(), hashlib.sha256).digest()).decode()
-        return {
-            "ACCESS-KEY": self.api_key,
-            "ACCESS-SIGN": sig,
-            "ACCESS-PASSPHRASE": self.passphrase,
-            "ACCESS-TIMESTAMP": ts,
-            "Content-Type": "application/json",
-            "locale": "en-US",
-        }, body_text
+        return {"ACCESS-KEY": self.api_key, "ACCESS-SIGN": sig, "ACCESS-PASSPHRASE": self.passphrase, "ACCESS-TIMESTAMP": ts, "Content-Type": "application/json", "locale": "en-US"}, body_text
 
     def place_futures_order(self, *, symbol: str, side: str, size: str, margin_mode: str = "isolated", order_type: str = "market", client_oid: str) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("Live Bitget trading is disabled. Enable it explicitly only after OOS + paper validation.")
         path = "/api/v2/mix/order/place-order"
-        body = {
-            "symbol": symbol,
-            "productType": "USDT-FUTURES",
-            "marginMode": margin_mode,
-            "marginCoin": "USDT",
-            "size": size,
-            "side": side,
-            "orderType": order_type,
-            "clientOid": client_oid,
-        }
+        body = {"symbol": symbol, "productType": "USDT-FUTURES", "marginMode": margin_mode, "marginCoin": "USDT", "size": size, "side": side, "orderType": order_type, "clientOid": client_oid}
         headers, body_text = self._headers("POST", path, None, body)
         with httpx.Client(timeout=self.timeout) as client:
             r = client.post(self.base_url + path, headers=headers, content=body_text)
