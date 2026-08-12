@@ -4,23 +4,22 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
+
+import pandas as pd
 
 from . import backtest as backtest_module
 from . import features as features_module
 from . import strategies as strategies_module
 from .backtest import BacktestConfig, run_backtest
 from .config import Settings
-from .features import build_feature_frame
 from .history_policy import normalize_backtest_window
 from .providers import BitgetPublicClient, CoinGlassClient
 from .reporting import save_report
+from .research import SOURCE_LABELS, STRATEGY_SOURCE_REQUIREMENTS, build_strategy_frame, source_status
 from .strategies import STRATEGIES
 from .universe import resolve_coinglass_instrument
 from .validation import evaluate_oos
-
-
-def _stage(name: str, message: str) -> None:
-    print(f"COINLAB_STAGE:{name}:{message}", flush=True)
 
 
 def _module_sha256(module) -> str:
@@ -31,82 +30,65 @@ def _resolved_coinglass_symbol(s: Settings) -> str:
     configured = str(s.coinglass_symbol or "").strip()
     if configured and configured.upper() != "AUTO":
         return configured
-    _stage("symbol", "正在確認 CoinGlass 與 Bitget 的商品對應")
     return resolve_coinglass_instrument(s.coinglass_api_key, s.coinglass_exchange, s.symbol)
 
 
-def fetch_and_build(s: Settings, *, start: str, end: str):
+def _source_calls(cg: CoinGlassClient):
+    return {
+        "oi": cg.open_interest,
+        "funding": cg.funding,
+        "liq": cg.liquidations,
+        "ls": cg.long_short,
+        "taker": cg.taker_flow,
+        "orderbook": cg.orderbook,
+    }
+
+
+def fetch_research_inputs(s: Settings, *, start: str, end: str):
     cg_symbol = _resolved_coinglass_symbol(s)
     cg = CoinGlassClient(s.coinglass_api_key)
     bg = BitgetPublicClient(base_url=s.bitget_rest_base_url)
-    common = dict(
-        exchange=s.coinglass_exchange,
-        symbol=cg_symbol,
-        interval=s.timeframe,
-        start=start,
-        end=end,
-    )
+    common = {"exchange": s.coinglass_exchange, "symbol": cg_symbol, "interval": s.timeframe, "start": start, "end": end}
     granularity = s.timeframe.replace("h", "H") if s.timeframe.endswith("h") else s.timeframe
 
-    _stage("bitget", "正在下載 Bitget 已完成 K 線")
+    print("COINLAB_STAGE:data:正在下載 Bitget 已完成 K 線。", flush=True)
     price = bg.candles(s.symbol, granularity, start, end)
     if price.empty:
         raise RuntimeError("Bitget returned no price candles; aborting rather than producing fake metrics.")
 
-    _stage("coinglass", "正在下載 CoinGlass OI / Funding / 清算 / 多空比 / Taker / Orderbook")
-    datasets = {
-        "oi": cg.open_interest(**common),
-        "funding": cg.funding(**common),
-        "liq": cg.liquidations(**common),
-        "ls": cg.long_short(**common),
-        "taker": cg.taker_flow(**common),
-        "orderbook": cg.orderbook(**common),
-    }
-    missing = [k for k, v in datasets.items() if v.empty]
-    if missing:
-        raise RuntimeError(f"CoinGlass returned empty required datasets: {missing}. Backtest aborted for integrity.")
+    datasets: dict[str, pd.DataFrame] = {}
+    diagnostics: dict[str, Any] = {}
+    for source_name, method in _source_calls(cg).items():
+        label = SOURCE_LABELS.get(source_name, source_name)
+        print(f"COINLAB_STAGE:data:正在取得 CoinGlass {label}。", flush=True)
+        try:
+            frame = method(**common)
+            datasets[source_name] = frame
+            diagnostics[source_name] = source_status(frame)
+        except Exception as exc:
+            datasets[source_name] = pd.DataFrame()
+            diagnostics[source_name] = source_status(None, exc)
 
-    _stage("align", "正在依時間戳精確對齊所有資料，缺資料不向未來補值")
-    features = build_feature_frame(
-        price,
-        datasets["oi"],
-        datasets["funding"],
-        datasets["liq"],
-        datasets["ls"],
-        datasets["taker"],
-        datasets["orderbook"],
-    )
-    stats = {
-        "bitget_symbol": s.symbol,
-        "resolved_coinglass_symbol": cg_symbol,
-        "bitget_price_rows": int(len(price)),
-        "coinglass_rows": {k: int(len(v)) for k, v in datasets.items()},
-        "aligned_rows": int(len(features)),
-        "aligned_coverage_vs_bitget": float(len(features) / len(price)) if len(price) else 0.0,
-    }
-    if stats["aligned_coverage_vs_bitget"] < s.min_aligned_coverage:
-        raise RuntimeError(
-            f"Aligned data coverage is only {stats['aligned_coverage_vs_bitget']:.2%}, below "
-            f"MIN_ALIGNED_COVERAGE={s.min_aligned_coverage:.0%}. Raw rows={stats}. "
-            "Aborting instead of backtesting an incomplete intersection; shorten/change the research range or source."
-        )
-
-    _stage("funding", "正在下載 Bitget 歷史資金費率並依結算時間加入損益")
-    funding_events = bg.funding_history(s.symbol, start, end)
-    return features, funding_events, stats
+    print("COINLAB_STAGE:data:正在讀取 Bitget 真實 Funding 結算紀錄。", flush=True)
+    try:
+        funding_events = bg.funding_history(s.symbol, start, end)
+        diagnostics["bitget_funding_events"] = {
+            "status": "ready", "rows": int(len(funding_events)),
+            "start": str(funding_events.index.min()) if len(funding_events) else None,
+            "end": str(funding_events.index.max()) if len(funding_events) else None,
+        }
+    except Exception as exc:
+        raise RuntimeError(f"Bitget funding history unavailable: {type(exc).__name__}: {exc}") from exc
+    return price, funding_events, datasets, diagnostics, cg_symbol
 
 
 def command_backtest(args):
     s = Settings()
-    _stage("prepare", "正在建立 CoinGlass Standard 可用的最大安全回測區間")
-    window = normalize_backtest_window(
-        timeframe=s.timeframe,
-        requested_start=s.start or None,
-        requested_end=s.end or None,
+    window = normalize_backtest_window(timeframe=s.timeframe, requested_start=s.start, requested_end=s.end)
+    print(f"COINLAB_STAGE:window:{window.message}", flush=True)
+    price, funding_events, datasets, source_diagnostics, cg_symbol = fetch_research_inputs(
+        s, start=window.used_start, end=window.used_end
     )
-    df, funding_events, source_stats = fetch_and_build(s, start=window.used_start, end=window.used_end)
-    if len(df) < 500:
-        raise RuntimeError(f"Only {len(df)} aligned rows. Refusing to treat this as a meaningful backtest.")
 
     cfg = BacktestConfig(
         initial_equity=s.initial_equity,
@@ -114,22 +96,32 @@ def command_backtest(args):
         fee_bps=s.taker_fee_bps,
         slippage_bps=s.slippage_bps,
     )
+    results: dict[str, tuple[pd.DataFrame, dict]] = {}
+    validation: dict[str, Any] = {}
+    features_by_strategy: dict[str, pd.DataFrame] = {}
+    strategy_diagnostics: dict[str, dict[str, Any]] = {}
 
-    _stage("backtest", "正在逐根 K 線回放六套策略；訊號收 K 後成立，下一根才允許成交")
-    results = {
-        name: run_backtest(df, fn, cfg, funding_events=funding_events)
-        for name, fn in STRATEGIES.items()
-    }
-
-    _stage("validation", "正在執行 60/20/20 與 Walk-forward 樣本外驗證")
-    validation = {
-        name: evaluate_oos(df, fn, cfg, funding_events=funding_events)
-        for name, fn in STRATEGIES.items()
-    }
+    print("COINLAB_STAGE:align:正在依每個策略真正需要的資料來源分別對時。", flush=True)
+    for name, fn in STRATEGIES.items():
+        frame, diagnostic = build_strategy_frame(
+            strategy_name=name,
+            price=price,
+            datasets=datasets,
+            min_coverage=s.min_aligned_coverage,
+            min_rows=500,
+        )
+        strategy_diagnostics[name] = diagnostic
+        if frame is None:
+            print(f"COINLAB_STAGE:skip:{name} 暫不回測：{diagnostic.get('reason', '必要資料不完整。')}", flush=True)
+            continue
+        features_by_strategy[name] = frame
+        print(f"COINLAB_STAGE:backtest:正在回測 {name}，有效對齊 {len(frame)} 根 K。", flush=True)
+        results[name] = run_backtest(frame, fn, cfg, funding_events=funding_events)
+        validation[name] = evaluate_oos(frame, fn, cfg, funding_events=funding_events)
 
     meta = {
         "symbol": s.symbol,
-        "coinglass_symbol": source_stats["resolved_coinglass_symbol"],
+        "coinglass_symbol": cg_symbol,
         "coinglass_symbol_setting": s.coinglass_symbol,
         "coinglass_exchange": s.coinglass_exchange,
         "timeframe": s.timeframe,
@@ -145,8 +137,11 @@ def command_backtest(args):
         "taker_fee_bps": s.taker_fee_bps,
         "slippage_bps": s.slippage_bps,
         "minimum_aligned_coverage": s.min_aligned_coverage,
-        "source_rows": source_stats,
+        "bitget_price_rows": int(len(price)),
+        "bitget_price_start": str(price.index.min()) if len(price) else None,
+        "bitget_price_end": str(price.index.max()) if len(price) else None,
         "bitget_funding_events": int(len(funding_events)),
+        "strategy_source_requirements": STRATEGY_SOURCE_REQUIREMENTS,
         "funding_model": "exact_published_rate_and_time_with_last_completed_market_candle_price_proxy",
         "code_fingerprints": {
             "strategies_py_sha256": _module_sha256(strategies_module),
@@ -155,15 +150,30 @@ def command_backtest(args):
         },
     }
 
-    _stage("report", "正在建立逐筆交易、策略統計與可複製報告")
+    print("COINLAB_STAGE:report:正在產生逐筆交易與可複製回測報告。", flush=True)
     report = save_report(
         args.out,
         metadata=meta,
-        features=df,
         results=results,
         validation=validation,
+        features_by_strategy=features_by_strategy,
+        strategy_diagnostics=strategy_diagnostics,
+        source_diagnostics=source_diagnostics,
     )
-    _stage("complete", f"回測完成，報告已建立：{report}")
+    if not results:
+        unavailable = [
+            SOURCE_LABELS.get(name, name)
+            for name, status in source_diagnostics.items()
+            if isinstance(status, dict) and status.get("status") in {"error", "empty"}
+        ]
+        joined = "、".join(unavailable) or "必要 CoinGlass 資料"
+        raise RuntimeError(
+            "ALL_STRATEGIES_SKIPPED: 所有策略都因資料來源不可用或對齊不足而未執行；"
+            f"主要缺少：{joined}。"
+        )
+    skipped = len(STRATEGIES) - len(results)
+    print(f"COINLAB_STAGE:done:回測完成：{len(results)} 套策略成功，{skipped} 套因資料完整性不足跳過。", flush=True)
+    print(report.read_text(encoding="utf-8"))
 
 
 def command_validate(args):
