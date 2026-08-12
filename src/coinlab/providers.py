@@ -42,7 +42,17 @@ class CoinGlassClient:
             raise RuntimeError(f"Unexpected CoinGlass response shape for {path}")
         return data
 
-    def history(self, path: str, *, exchange: str, symbol: str, interval: str, start: str, end: str, extra: dict[str, Any] | None = None) -> pd.DataFrame:
+    def history(
+        self,
+        path: str,
+        *,
+        exchange: str,
+        symbol: str,
+        interval: str,
+        start: str,
+        end: str,
+        extra: dict[str, Any] | None = None,
+    ) -> pd.DataFrame:
         start_ms, end_ms = _utc_ms(start), _utc_ms(end)
         cursor_end = end_ms
         rows: list[dict[str, Any]] = []
@@ -109,7 +119,13 @@ class BitgetPublicClient:
         rows: dict[int, list[str]] = {}
         with httpx.Client(timeout=self.timeout) as client:
             while cursor > start_ms:
-                params = {"symbol": symbol, "granularity": granularity, "productType": product_type, "endTime": cursor, "limit": 200}
+                params = {
+                    "symbol": symbol,
+                    "granularity": granularity,
+                    "productType": product_type,
+                    "endTime": cursor,
+                    "limit": 200,
+                }
                 r = client.get(self.base_url + "/api/v2/mix/market/history-candles", params=params)
                 r.raise_for_status()
                 payload = r.json()
@@ -135,6 +151,34 @@ class BitgetPublicClient:
         out.index = pd.to_datetime(out.index.astype("int64"), unit="ms", utc=True)
         out = out.drop(columns=["time"]).sort_index()
         return out.astype(float)
+
+    def funding_history(self, symbol: str, start: str, end: str, product_type: str = "usdt-futures") -> pd.DataFrame:
+        start_ms, end_ms = _utc_ms(start), _utc_ms(end)
+        rows: dict[int, float] = {}
+        with httpx.Client(timeout=self.timeout) as client:
+            for page_no in range(1, 101):
+                params = {"symbol": symbol, "productType": product_type, "pageSize": 100, "pageNo": page_no}
+                r = client.get(self.base_url + "/api/v2/mix/market/history-fund-rate", params=params)
+                r.raise_for_status()
+                payload = r.json()
+                if payload.get("code") != "00000":
+                    raise RuntimeError(f"Bitget funding history error: {payload}")
+                batch = payload.get("data", [])
+                if not batch:
+                    break
+                times = []
+                for item in batch:
+                    t = int(item["fundingTime"])
+                    times.append(t)
+                    if start_ms <= t <= end_ms:
+                        rows[t] = float(item["fundingRate"])
+                if min(times) <= start_ms:
+                    break
+        if not rows:
+            return pd.DataFrame(columns=["funding_rate"])
+        out = pd.DataFrame({"funding_rate": pd.Series(rows)})
+        out.index = pd.to_datetime(out.index.astype("int64"), unit="ms", utc=True)
+        return out.sort_index()
 
 
 @dataclass
