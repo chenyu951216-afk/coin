@@ -12,19 +12,16 @@ from .research_package import build_audit_package, build_research_package
 
 app = FastAPI(
     title="CoinGlass × Bitget Strategy Lab",
-    version="0.5.0",
-    description="Real-data strategy research with anti-overfit research packages, detailed backtests and continuous scanning.",
+    version="0.6.0",
+    description="Real-data derivatives strategy research with cost-aware execution filters, anti-overfit research packages and continuous scanning.",
 )
 
 # Reuse the already-tested v0.4 API routes and their module state, but own the
-# root page and new downloadable-artifact endpoints in v0.5.
+# root page and downloadable-artifact endpoints here.
 _SKIP_PATHS = {"/", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 for route in v4.app.router.routes:
     if getattr(route, "path", None) not in _SKIP_PATHS:
         app.router.routes.append(route)
-# FastAPI/Starlette versions in this project expose startup/shutdown handlers on
-# the router. Copy the tested v0.4 handlers directly rather than relying on the
-# removed app.add_event_handler compatibility API.
 app.router.on_startup.extend(v4.app.router.on_startup)
 app.router.on_shutdown.extend(v4.app.router.on_shutdown)
 
@@ -33,6 +30,8 @@ _old_button = '<button id="copyReportBtn" class="hidden" style="margin-top:9px" 
 _new_buttons = (
     '<div class="notice" style="margin-top:10px">平常要傳給 ChatGPT 改策略，請下載「研究包」。'
     '研究包會刻意排除 locked test 明細，避免反覆調參污染 OOS。完整稽核包只在策略候選凍結後使用。</div>'
+    '<div class="notice">v0.6 已加入成本感知：若預估來回手續費＋滑價吃掉超過 0.18R，該訊號在回測與掃描都會被拒絕；'
+    '逐筆交易也會保存進場當下的特徵快照，供下一輪研究。</div>'
     '<div class="row" style="margin-top:9px">'
     '<button id="researchDownloadBtn" class="hidden primary" onclick="downloadResearchPackage()">下載研究包 ZIP（傳給 ChatGPT）</button>'
     '<button id="auditDownloadBtn" class="hidden" onclick="downloadAuditPackage()">下載完整稽核包 ZIP（最終驗證）</button>'
@@ -40,11 +39,20 @@ _new_buttons = (
 )
 
 DASHBOARD = v4.DASHBOARD
-DASHBOARD = DASHBOARD.replace("Strategy Lab v0.4", "Strategy Lab v0.5")
-DASHBOARD = DASHBOARD.replace("v0.4 · 多幣種", "v0.5 · 多幣種")
+DASHBOARD = DASHBOARD.replace("Strategy Lab v0.4", "Strategy Lab v0.6")
+DASHBOARD = DASHBOARD.replace("v0.4 · 多幣種", "v0.6 · 成本感知 · 多幣種")
 DASHBOARD = DASHBOARD.replace(_old_button, _new_buttons)
 DASHBOARD = DASHBOARD.replace("$('copyReportBtn').classList.add('hidden');", "$('researchDownloadBtn').classList.add('hidden');$('auditDownloadBtn').classList.add('hidden');")
 DASHBOARD = DASHBOARD.replace("$('copyReportBtn').classList.remove('hidden');", "$('researchDownloadBtn').classList.remove('hidden');$('auditDownloadBtn').classList.remove('hidden');")
+# Surface estimated execution cost in the scan table when present.
+DASHBOARD = DASHBOARD.replace(
+    '<th>R</th><th>24h 成交額</th>',
+    '<th>R</th><th>預估成本R</th><th>24h 成交額</th>',
+)
+DASHBOARD = DASHBOARD.replace(
+    "<td>${fmt(m.reward_r,2)}</td><td>${fmt(m.volume_24h_usdt,0)}</td>",
+    "<td>${fmt(m.reward_r,2)}</td><td>${fmt(m.estimated_cost_r,3)}</td><td>${fmt(m.volume_24h_usdt,0)}</td>",
+)
 
 _download_js = r'''
 async function downloadBacktestFile(url,label){
@@ -115,4 +123,4 @@ def download_audit_package() -> FileResponse:
 
 @app.get("/health-v5")
 def health_v5() -> dict[str, Any]:
-    return {"ok": True, "version": "0.5.0", "downloadable_research_packages": True}
+    return {"ok": True, "version": "0.6.0", "downloadable_research_packages": True, "cost_aware_execution_gate": True}
