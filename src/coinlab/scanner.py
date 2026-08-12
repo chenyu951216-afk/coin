@@ -45,18 +45,27 @@ def _closed_window(timeframe: str, bars: int) -> tuple[str, str]:
     return _iso(start), _iso(last_closed_open)
 
 
-def next_completed_bar_time(timeframe: str, grace_seconds: int = 8) -> str:
+def next_completed_bar_time(
+    timeframe: str,
+    now: datetime | None = None,
+    grace_seconds: int = 8,
+) -> str:
     minutes = _INTERVAL_MINUTES[timeframe]
-    now = datetime.now(timezone.utc)
-    minute_bucket = int(now.timestamp() // 60)
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    minute_bucket = int(current.timestamp() // 60)
     next_bucket = minute_bucket - (minute_bucket % minutes) + minutes
     return _iso(datetime.fromtimestamp(next_bucket * 60 + max(0, grace_seconds), tz=timezone.utc))
 
 
-def seconds_until_next_completed_bar(timeframe: str, grace_seconds: int = 8) -> float:
-    target = pd.Timestamp(next_completed_bar_time(timeframe, grace_seconds))
-    now = pd.Timestamp.now(tz="UTC")
-    return max(1.0, float((target - now).total_seconds()))
+def seconds_until_next_completed_bar(
+    timeframe: str,
+    now: datetime | None = None,
+    grace_seconds: int = 8,
+) -> float:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    target = pd.Timestamp(next_completed_bar_time(timeframe, now=current, grace_seconds=grace_seconds))
+    current_ts = pd.Timestamp(current)
+    return max(1.0, float((target - current_ts).total_seconds()))
 
 
 def derive_strategy_levels(df: pd.DataFrame, signal: StrategySignal, entry: float | None = None) -> dict[str, float]:
