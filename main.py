@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from coinlab.server_v4 import app
+from coinlab.server_v5 import app
 
 
 if __name__ == "__main__":
