@@ -7,8 +7,8 @@ from typing import Any, Callable
 import pandas as pd
 
 from .exchange import BitgetV2Client
-from .features import build_feature_frame
 from .providers import BitgetPublicClient, CoinGlassClient
+from .research import SOURCE_LABELS, build_strategy_frame, source_status, strategy_requirements
 from .strategies import STRATEGIES, StrategySignal
 from .universe import get_coinglass_exchange_pairs, resolve_coinglass_instrument
 
@@ -35,20 +35,6 @@ def _iso(ts: datetime) -> str:
     return ts.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def seconds_until_next_completed_bar(timeframe: str, now: datetime | None = None, grace_seconds: int = 8) -> int:
-    minutes = _INTERVAL_MINUTES[timeframe]
-    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    interval_seconds = minutes * 60
-    epoch = int(current.timestamp())
-    next_boundary = ((epoch // interval_seconds) + 1) * interval_seconds + grace_seconds
-    return max(1, next_boundary - epoch)
-
-
-def next_completed_bar_time(timeframe: str, now: datetime | None = None, grace_seconds: int = 8) -> str:
-    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    return _iso(current + timedelta(seconds=seconds_until_next_completed_bar(timeframe, current, grace_seconds)))
-
-
 def _closed_window(timeframe: str, bars: int) -> tuple[str, str]:
     minutes = _INTERVAL_MINUTES[timeframe]
     now = datetime.now(timezone.utc)
@@ -59,8 +45,21 @@ def _closed_window(timeframe: str, bars: int) -> tuple[str, str]:
     return _iso(start), _iso(last_closed_open)
 
 
+def next_completed_bar_time(timeframe: str, grace_seconds: int = 8) -> str:
+    minutes = _INTERVAL_MINUTES[timeframe]
+    now = datetime.now(timezone.utc)
+    minute_bucket = int(now.timestamp() // 60)
+    next_bucket = minute_bucket - (minute_bucket % minutes) + minutes
+    return _iso(datetime.fromtimestamp(next_bucket * 60 + max(0, grace_seconds), tz=timezone.utc))
+
+
+def seconds_until_next_completed_bar(timeframe: str, grace_seconds: int = 8) -> float:
+    target = pd.Timestamp(next_completed_bar_time(timeframe, grace_seconds))
+    now = pd.Timestamp.now(tz="UTC")
+    return max(1.0, float((target - now).total_seconds()))
+
+
 def derive_strategy_levels(df: pd.DataFrame, signal: StrategySignal, entry: float | None = None) -> dict[str, float]:
-    """Mirror the current backtest's initial ATR + confirmed-structure exit geometry."""
     if df.empty:
         raise ValueError("empty feature frame")
     row = df.iloc[-1]
@@ -84,33 +83,36 @@ def derive_strategy_levels(df: pd.DataFrame, signal: StrategySignal, entry: floa
         "entry": entry_price,
         "stop_loss": stop,
         "take_profit": target,
-        "atr": atr,
         "stop_pct": actual_distance / entry_price if entry_price else 0.0,
         "take_profit_pct": abs(target - entry_price) / entry_price if entry_price else 0.0,
+        "atr": atr,
     }
 
 
 def _public_prefilter(exchange: BitgetV2Client, cfg: ScanConfig) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     contracts = {c["symbol"]: c for c in exchange.get_contracts()}
-    tickers = exchange.get_tickers()
-    candidates: list[dict[str, Any]] = []
-    for t in tickers:
-        symbol = t["symbol"]
+    candidates = []
+    for ticker in exchange.get_tickers():
+        symbol = ticker["symbol"]
         if symbol not in contracts:
             continue
-        turnover = float(t.get("volume_24h_usdt") or 0)
-        spread = t.get("spread_pct")
+        turnover = float(ticker.get("volume_24h_usdt") or 0)
+        spread = ticker.get("spread_pct")
         if turnover < cfg.min_turnover_usdt:
             continue
         if spread is not None and float(spread) > cfg.max_spread_pct:
             continue
-        candidates.append({**contracts[symbol], **t})
+        candidates.append({**contracts[symbol], **ticker})
     candidates.sort(key=lambda x: float(x.get("volume_24h_usdt") or 0), reverse=True)
     if cfg.max_symbols > 0:
-        candidates = candidates[:cfg.max_symbols]
-    return candidates, {
-        "bitget_tradable_contracts": len(contracts),
-        "bitget_public_prefilter_pass": len(candidates),
+        candidates = candidates[: cfg.max_symbols]
+    return candidates, {"bitget_tradable_contracts": len(contracts), "bitget_public_prefilter_pass": len(candidates)}
+
+
+def _source_calls(cg: CoinGlassClient):
+    return {
+        "oi": cg.open_interest, "funding": cg.funding, "liq": cg.liquidations,
+        "ls": cg.long_short, "taker": cg.taker_flow, "orderbook": cg.orderbook,
     }
 
 
@@ -123,7 +125,6 @@ def scan_market(
 ) -> dict[str, Any]:
     if cfg.timeframe not in _INTERVAL_MINUTES:
         raise ValueError(f"unsupported scan timeframe: {cfg.timeframe}")
-
     bitget_exchange = BitgetV2Client()
     bitget_market = BitgetPublicClient()
     cg = CoinGlassClient(coinglass_api_key)
@@ -132,101 +133,116 @@ def scan_market(
     candidates, stats = _public_prefilter(bitget_exchange, cfg)
     candidates = [c for c in candidates if c.get("base_coin") in pair_bases]
     stats["coinglass_supported_after_prefilter"] = len(candidates)
-
     start, end = _closed_window(cfg.timeframe, cfg.lookback_bars)
     granularity = cfg.timeframe.replace("h", "H") if cfg.timeframe.endswith("h") else cfg.timeframe
+
     matches: list[dict[str, Any]] = []
     no_signal: list[str] = []
-    skipped: list[dict[str, str]] = []
-    paused = False
+    skipped_symbols: list[dict[str, Any]] = []
+    source_fail_counts = {name: 0 for name in SOURCE_LABELS}
+    strategy_skip_counts = {name: 0 for name in STRATEGIES}
 
     for i, candidate in enumerate(candidates, 1):
         if should_stop and should_stop():
-            paused = True
-            break
+            return {
+                "status": "paused", "timeframe": cfg.timeframe, "window": {"start": start, "end": end},
+                "stats": {**stats, "evaluated": i - 1, "matched_signals": len(matches),
+                          "matched_symbols": len({m["symbol"] for m in matches}),
+                          "source_fail_counts": source_fail_counts, "strategy_skip_counts": strategy_skip_counts},
+                "matches": matches, "skipped": skipped_symbols[:100],
+            }
         symbol = str(candidate["symbol"])
         if progress:
             progress({"current": i, "total": len(candidates), "symbol": symbol})
         try:
-            cg_symbol = resolve_coinglass_instrument(
-                coinglass_api_key, cfg.coinglass_exchange, symbol, pairs=pairs
-            )
-            common = dict(
-                exchange=cfg.coinglass_exchange,
-                symbol=cg_symbol,
-                interval=cfg.timeframe,
-                start=start,
-                end=end,
-            )
+            cg_symbol = resolve_coinglass_instrument(coinglass_api_key, cfg.coinglass_exchange, symbol, pairs=pairs)
+            common = {"exchange": cfg.coinglass_exchange, "symbol": cg_symbol, "interval": cfg.timeframe, "start": start, "end": end}
             price = bitget_market.candles(symbol, granularity, start, end)
-            datasets = {
-                "oi": cg.open_interest(**common),
-                "funding": cg.funding(**common),
-                "liq": cg.liquidations(**common),
-                "ls": cg.long_short(**common),
-                "taker": cg.taker_flow(**common),
-                "orderbook": cg.orderbook(**common),
-            }
-            if price.empty or any(v.empty for v in datasets.values()):
-                raise RuntimeError("one or more required history sources returned no rows")
-            frame = build_feature_frame(
-                price, datasets["oi"], datasets["funding"], datasets["liq"],
-                datasets["ls"], datasets["taker"], datasets["orderbook"]
-            ).dropna(subset=["atr14"])
-            if len(frame) < cfg.min_aligned_rows:
-                raise RuntimeError(f"only {len(frame)} aligned rows; need {cfg.min_aligned_rows}")
+            if price.empty:
+                skipped_symbols.append({"symbol": symbol, "reason": "Bitget 沒有回傳價格 K 線。"})
+                continue
 
-            latest = frame.iloc[-1]
+            datasets: dict[str, pd.DataFrame] = {}
+            source_diags: dict[str, Any] = {}
+            for source_name, method in _source_calls(cg).items():
+                if should_stop and should_stop():
+                    break
+                try:
+                    frame = method(**common)
+                    datasets[source_name] = frame
+                    source_diags[source_name] = source_status(frame)
+                    if frame.empty:
+                        source_fail_counts[source_name] += 1
+                except Exception as exc:
+                    datasets[source_name] = pd.DataFrame()
+                    source_diags[source_name] = source_status(None, exc)
+                    source_fail_counts[source_name] += 1
+            if should_stop and should_stop():
+                continue
+
             symbol_matched = False
+            any_strategy_ready = False
+            frame_cache: dict[tuple[str, ...], pd.DataFrame | None] = {}
+            diag_cache: dict[tuple[str, ...], dict[str, Any]] = {}
             for strategy_name, fn in STRATEGIES.items():
-                sig = fn(latest)
-                if sig.direction == 0:
+                requirements = strategy_requirements(strategy_name)
+                if requirements not in frame_cache:
+                    frame, diagnostic = build_strategy_frame(
+                        strategy_name=strategy_name,
+                        price=price,
+                        datasets=datasets,
+                        min_coverage=0.90,
+                        min_rows=cfg.min_aligned_rows,
+                    )
+                    frame_cache[requirements] = frame
+                    diag_cache[requirements] = diagnostic
+                frame = frame_cache[requirements]
+                diagnostic = diag_cache[requirements]
+                if frame is None:
+                    strategy_skip_counts[strategy_name] += 1
+                    continue
+                any_strategy_ready = True
+                usable = frame.dropna(subset=["atr14"])
+                if usable.empty:
+                    strategy_skip_counts[strategy_name] += 1
+                    continue
+                signal = fn(usable.iloc[-1])
+                if signal.direction == 0:
                     continue
                 symbol_matched = True
-                levels = derive_strategy_levels(frame, sig)
-                direction = "long" if sig.direction > 0 else "short"
+                levels = derive_strategy_levels(frame, signal)
                 signal_time = str(frame.index[-1])
-                signal_key = f"{symbol}|{strategy_name}|{direction}|{signal_time}"
+                direction = "long" if signal.direction > 0 else "short"
                 matches.append({
-                    "signal_key": signal_key,
-                    "symbol": symbol,
-                    "base_coin": candidate.get("base_coin"),
-                    "strategy": strategy_name,
-                    "direction": direction,
-                    "direction_text": "多" if sig.direction > 0 else "空",
-                    "signal_time": signal_time,
-                    "reference_price": levels["entry"],
-                    "stop_loss": levels["stop_loss"],
-                    "take_profit": levels["take_profit"],
-                    "stop_pct": levels["stop_pct"],
-                    "take_profit_pct": levels["take_profit_pct"],
-                    "reward_r": sig.reward_r,
-                    "atr": levels["atr"],
-                    "volume_24h_usdt": candidate.get("volume_24h_usdt"),
-                    "spread_pct": candidate.get("spread_pct"),
-                    "coinglass_exchange": cfg.coinglass_exchange,
-                    "coinglass_instrument": cg_symbol,
-                    "aligned_rows": len(frame),
+                    "signal_key": f"{symbol}|{strategy_name}|{direction}|{signal_time}",
+                    "symbol": symbol, "base_coin": candidate.get("base_coin"), "strategy": strategy_name,
+                    "direction": direction, "direction_text": "做多" if signal.direction > 0 else "做空",
+                    "signal_time": signal_time, "reference_price": levels["entry"],
+                    "stop_loss": levels["stop_loss"], "stop_pct": levels["stop_pct"],
+                    "take_profit": levels["take_profit"], "take_profit_pct": levels["take_profit_pct"],
+                    "reward_r": signal.reward_r, "atr": levels["atr"],
+                    "volume_24h_usdt": candidate.get("volume_24h_usdt"), "spread_pct": candidate.get("spread_pct"),
+                    "coinglass_exchange": cfg.coinglass_exchange, "coinglass_instrument": cg_symbol,
+                    "aligned_rows": len(frame), "data_window_start": diagnostic.get("common_start"),
+                    "data_window_end": diagnostic.get("common_end"), "required_sources": list(requirements),
                 })
             if not symbol_matched:
                 no_signal.append(symbol)
+            if not any_strategy_ready:
+                failed_sources = [SOURCE_LABELS.get(name, name) for name, diag in source_diags.items() if diag.get("status") != "ready"]
+                skipped_symbols.append({
+                    "symbol": symbol,
+                    "reason": "沒有任何策略具備完整必要資料。" + (f" 缺失／失敗來源：{'、'.join(failed_sources)}。" if failed_sources else ""),
+                })
         except Exception as exc:
-            skipped.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
+            skipped_symbols.append({"symbol": symbol, "reason": f"幣種資料準備失敗：{type(exc).__name__}: {exc}"})
 
     matches.sort(key=lambda x: (x["symbol"], x["strategy"]))
-    evaluated = max(0, (i if candidates else 0) - len(skipped)) if paused else len(candidates) - len(skipped)
     return {
-        "status": "paused" if paused else "completed",
-        "timeframe": cfg.timeframe,
-        "window": {"start": start, "end": end},
-        "stats": {
-            **stats,
-            "evaluated": evaluated,
-            "matched_signals": len(matches),
-            "matched_symbols": len({m["symbol"] for m in matches}),
-            "no_signal_symbols": len(no_signal),
-            "skipped": len(skipped),
-        },
-        "matches": matches,
-        "skipped": skipped[:100],
+        "status": "completed", "timeframe": cfg.timeframe, "window": {"start": start, "end": end},
+        "stats": {**stats, "evaluated": len(candidates), "matched_signals": len(matches),
+                  "matched_symbols": len({m["symbol"] for m in matches}), "no_signal_symbols": len(no_signal),
+                  "skipped_symbols": len(skipped_symbols), "source_fail_counts": source_fail_counts,
+                  "strategy_skip_counts": strategy_skip_counts},
+        "matches": matches, "skipped": skipped_symbols[:100],
     }
