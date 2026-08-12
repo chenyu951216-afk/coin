@@ -2,6 +2,7 @@ import pandas as pd
 
 from coinlab.backtest import BacktestConfig, run_backtest
 from coinlab.strategies import StrategySignal
+from coinlab.validation import evaluate_oos
 
 
 def _always_long(row):
@@ -62,3 +63,31 @@ def test_stop_updates_only_after_bar_close():
     trades, _ = run_backtest(df, _always_long, BacktestConfig(slippage_bps=0, fee_bps=0, max_holding_bars=2))
     assert trades.iloc[0].reason == "stop"
     assert not bool(trades.iloc[0].breakeven_activated)
+
+
+def test_funding_is_applied_without_using_post_settlement_price():
+    idx = pd.date_range("2026-01-01 00:00", periods=5, freq="15min", tz="UTC")
+    df = pd.DataFrame({
+        "open": [100, 100, 100, 100, 100],
+        "high": [100, 100.5, 100.5, 100.5, 100.5],
+        "low": [100, 99.5, 99.5, 99.5, 99.5],
+        "close": [100, 100, 100, 100, 100],
+        "atr14": [1, 1, 1, 1, 1],
+    }, index=idx)
+    funding = pd.DataFrame({"funding_rate": [0.001]}, index=pd.DatetimeIndex([idx[2]]))
+    trades, _ = run_backtest(df, _always_long, BacktestConfig(slippage_bps=0, fee_bps=0, max_holding_bars=3), funding_events=funding)
+    assert trades.iloc[0].funding_pnl < 0
+
+
+def test_oos_accepts_funding_events_without_leaking_across_slices():
+    idx = pd.date_range("2026-01-01", periods=100, freq="15min", tz="UTC")
+    df = pd.DataFrame({
+        "open": [100.0] * 100,
+        "high": [100.2] * 100,
+        "low": [99.8] * 100,
+        "close": [100.0] * 100,
+        "atr14": [1.0] * 100,
+    }, index=idx)
+    funding = pd.DataFrame({"funding_rate": [0.001]}, index=pd.DatetimeIndex([idx[70]]))
+    result = evaluate_oos(df, _always_long, BacktestConfig(slippage_bps=0, fee_bps=0, max_holding_bars=1), funding_events=funding)
+    assert set(result["split"]) == {"train", "validation", "test"}
