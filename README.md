@@ -19,7 +19,7 @@ These are research hypotheses, **not claimed profitable strategies**. The repo i
 - Earliest entry is bar `t+1` open.
 - No `shift(-1)`/future feature is used to create a signal.
 - CoinGlass and Bitget datasets are joined on exact timestamps; missing derivative bars are not forward-filled into the future.
-- Market entries/exits include configurable slippage and both-side taker fees.
+- Market entries/exits include configurable slippage and both-side taker fees; positions crossing Bitget funding timestamps also include the published historical funding rate.
 - Position size is based on equity risk and ATR stop distance, not arbitrary leverage.
 - If TP and SL are both touched inside one OHLC bar and no lower-timeframe path is available, the engine uses **stop-first** and records `ambiguous_exit=true`.
 - One strategy cannot stack overlapping positions in the same backtest.
@@ -78,7 +78,6 @@ The first version prioritizes correctness and auditability. Before real money, a
 
 - parameter search that tunes only on train/validation and keeps the final test set untouched;
 - 1m sub-bar execution data for resolving same-bar TP/SL instead of conservative stop-first;
-- exact Bitget funding settlements for positions spanning a funding timestamp;
 - latency/spread model calibrated from live Bitget data;
 - paper-trading shadow mode before any live-order switch.
 
@@ -99,4 +98,4 @@ This grade is a research filter, not a promise of future profit.
 
 Initial risk uses the farther of strategy ATR risk and a confirmed 12-bar swing structure, capped at 3.5 ATR to avoid a distant wick creating tiny position size. Stop management is close-confirmed: after a bar **closes** at +1R the stop may move to breakeven for the next bar; after a close at +1.5R an ATR trail may tighten for later bars. The engine never retroactively moves a stop inside the same candle.
 
-Trade CSVs also include MFE-R, MAE-R, holding bars, breakeven activation, trailing activation and ambiguous exits, which makes later strategy diagnosis much more useful than win rate alone.
+Trade CSVs also include funding PnL, MFE-R, MAE-R, holding bars, breakeven activation, trailing activation and ambiguous exits, which makes later strategy diagnosis much more useful than win rate alone.
