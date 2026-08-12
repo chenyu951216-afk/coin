@@ -39,6 +39,7 @@ def save_report(outdir: str, *, metadata: dict[str, Any], features: pd.DataFrame
             "features_sha256": _sha256_file(features_path),
             "no_lookahead": "signal_at_close_t_entry_at_open_t_plus_1",
             "same_bar_tp_sl_policy": "stop_first",
+            "funding": "Bitget historical fundingRate/fundingTime; settlement notional uses last completed pre-settlement market candle close",
         },
         "strategies": strategies,
         "validation": validation or {},
