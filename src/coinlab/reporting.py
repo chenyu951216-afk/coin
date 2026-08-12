@@ -61,15 +61,38 @@ def save_report(
     metadata: dict[str, Any],
     results: dict[str, tuple[pd.DataFrame, dict]],
     validation: dict[str, Any] | None = None,
+    features: pd.DataFrame | None = None,
     features_by_strategy: dict[str, pd.DataFrame] | None = None,
     strategy_diagnostics: dict[str, dict[str, Any]] | None = None,
     source_diagnostics: dict[str, dict[str, Any]] | None = None,
 ) -> Path:
+    """Write a reproducible backtest report.
+
+    ``features`` is retained for the original v2 API. New research runs use
+    ``features_by_strategy`` so each strategy can be aligned only to the data
+    sources it actually consumes. The JSON schema remains v2-compatible while
+    adding optional diagnostics fields.
+    """
     root = Path(outdir)
     root.mkdir(parents=True, exist_ok=True)
-    features_by_strategy = features_by_strategy or {}
+    features_by_strategy = dict(features_by_strategy or {})
     strategy_diagnostics = strategy_diagnostics or {}
     source_diagnostics = source_diagnostics or {}
+
+    legacy_integrity: dict[str, Any] = {}
+    if features is not None:
+        legacy_path = root / "aligned_features.csv"
+        features.to_csv(legacy_path, index=True)
+        legacy_integrity = {
+            "aligned_rows": int(len(features)),
+            "start": str(features.index.min()) if len(features) else None,
+            "end": str(features.index.max()) if len(features) else None,
+            "features_sha256": _sha256_file(legacy_path),
+        }
+        # Preserve the original single/global-frame behavior for callers that
+        # have not migrated to strategy-specific alignment yet.
+        if not features_by_strategy:
+            features_by_strategy = {name: features for name in results}
 
     strategies: dict[str, Any] = {}
     all_trades: list[dict[str, Any]] = []
@@ -125,12 +148,15 @@ def save_report(
     skipped = [name for name, value in strategies.items() if value["status"] != "COMPLETED"]
 
     report = {
-        "schema_version": "coinlab.backtest.v3",
+        # Keep v2 because existing web/chat consumers already understand it;
+        # resilience diagnostics are additive rather than a breaking schema change.
+        "schema_version": "coinlab.backtest.v2",
         "status": "REAL_DATA_BACKTEST",
         "execution_status": "COMPLETED" if executed else "NO_STRATEGIES_EXECUTED",
         "metadata": _json_safe(metadata),
         "source_diagnostics": _json_safe(source_diagnostics),
         "data_integrity": {
+            **legacy_integrity,
             "strategy_frames": feature_integrity,
             "no_lookahead": "signal_at_close_t_entry_at_open_t_plus_1",
             "same_bar_tp_sl_policy": "stop_first",
