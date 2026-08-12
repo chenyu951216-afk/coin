@@ -17,8 +17,7 @@ def fetch_and_build(s: Settings):
     cg = CoinGlassClient(s.coinglass_api_key)
     bg = BitgetPublicClient()
     common = dict(exchange=s.coinglass_exchange, symbol=s.coinglass_symbol, interval=s.timeframe, start=s.start, end=s.end)
-    granularity = s.timeframe.replace("h", "H") if s.timeframe.endswith("h") else s.timeframe
-    price = bg.candles(s.symbol, granularity, s.start, s.end)
+    price = bg.candles(s.symbol, s.timeframe.replace("h", "H") if s.timeframe.endswith("h") else s.timeframe, s.start, s.end)
     if price.empty:
         raise RuntimeError("Bitget returned no price candles; aborting rather than producing fake metrics.")
     datasets = {
@@ -32,12 +31,13 @@ def fetch_and_build(s: Settings):
     missing = [k for k, v in datasets.items() if v.empty]
     if missing:
         raise RuntimeError(f"CoinGlass returned empty required datasets: {missing}. Backtest aborted for integrity.")
-    return build_feature_frame(price, datasets["oi"], datasets["funding"], datasets["liq"], datasets["ls"], datasets["taker"], datasets["orderbook"])
+    funding_events = bg.funding_history(s.symbol, s.start, s.end)
+    return build_feature_frame(price, datasets["oi"], datasets["funding"], datasets["liq"], datasets["ls"], datasets["taker"], datasets["orderbook"]), funding_events
 
 
 def command_backtest(args):
     s = Settings()
-    df = fetch_and_build(s)
+    df, funding_events = fetch_and_build(s)
     if len(df) < 500:
         raise RuntimeError(f"Only {len(df)} aligned rows. Refusing to treat this as a meaningful backtest.")
     cfg = BacktestConfig(
@@ -46,8 +46,8 @@ def command_backtest(args):
         fee_bps=s.taker_fee_bps,
         slippage_bps=s.slippage_bps,
     )
-    results = {name: run_backtest(df, fn, cfg) for name, fn in STRATEGIES.items()}
-    validation = {name: evaluate_oos(df, fn, cfg) for name, fn in STRATEGIES.items()}
+    results = {name: run_backtest(df, fn, cfg, funding_events=funding_events) for name, fn in STRATEGIES.items()}
+    validation = {name: evaluate_oos(df, fn, cfg, funding_events=funding_events) for name, fn in STRATEGIES.items()}
     meta = {
         "symbol": s.symbol,
         "coinglass_symbol": s.coinglass_symbol,
@@ -59,6 +59,8 @@ def command_backtest(args):
         "risk_per_trade": s.risk_per_trade,
         "taker_fee_bps": s.taker_fee_bps,
         "slippage_bps": s.slippage_bps,
+        "bitget_funding_events": int(len(funding_events)),
+        "funding_model": "exact_rate_and_time_with_last_completed_market_candle_price_proxy",
     }
     report = save_report(args.out, metadata=meta, features=df, results=results, validation=validation)
     print(report.read_text(encoding="utf-8"))
