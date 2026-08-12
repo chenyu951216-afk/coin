@@ -17,7 +17,7 @@ class BacktestConfig:
     fee_bps: float = 6.0
     slippage_bps: float = 2.0
     max_holding_bars: int = 48
-    ambiguous_policy: str = "stop_first"
+    ambiguous_policy: str = "stop_first"  # only conservative policy is accepted by default
 
 
 @dataclass
@@ -34,6 +34,7 @@ class Trade:
     size: float
     gross_pnl: float
     fees: float
+    funding_pnl: float
     net_pnl: float
     r_multiple: float
     reason: str
@@ -55,7 +56,7 @@ def _fill_exit(price: float, direction: int, slippage_bps: float) -> float:
     return price * (1 - slip * direction)
 
 
-def run_backtest(df: pd.DataFrame, strategy: Callable[[pd.Series], StrategySignal], cfg: BacktestConfig) -> tuple[pd.DataFrame, dict]:
+def run_backtest(df: pd.DataFrame, strategy: Callable[[pd.Series], StrategySignal], cfg: BacktestConfig, funding_events: pd.DataFrame | None = None) -> tuple[pd.DataFrame, dict]:
     required = {"open", "high", "low", "close", "atr14"}
     missing = required - set(df.columns)
     if missing:
@@ -82,13 +83,14 @@ def run_backtest(df: pd.DataFrame, strategy: Callable[[pd.Series], StrategySigna
         if stop_distance <= 0 or not math.isfinite(stop_distance):
             i += 1
             continue
-
+        # Initial stop combines strategy ATR distance with recently confirmed market structure.
         lookback = df.iloc[max(0, i - 11): i + 1]
         atr = float(signal_row["atr14"])
         if signal.direction > 0:
             structure_stop = float(lookback["low"].min()) - 0.15 * atr
             atr_stop = entry - stop_distance
             raw_stop = min(atr_stop, structure_stop)
+            # Prevent pathological position sizing from a distant historical wick.
             stop = max(raw_stop, entry - 3.5 * atr)
         else:
             structure_stop = float(lookback["high"].max()) + 0.15 * atr
@@ -133,12 +135,13 @@ def run_backtest(df: pd.DataFrame, strategy: Callable[[pd.Series], StrategySigna
                 exit_price, exit_i, reason = target, j, "target"
                 break
 
-            # Stop updates happen only after this bar closes, so they affect future bars only.
+            # Stop updates happen only AFTER this bar closes, so they can only affect future bars.
             close_now = float(bar.close)
             atr_now = float(bar.atr14) if np.isfinite(bar.atr14) else atr
             favorable_close = (close_now - entry) * signal.direction
             if favorable_close >= stop_distance:
-                current_stop = max(current_stop, entry) if signal.direction > 0 else min(current_stop, entry)
+                be_stop = entry
+                current_stop = max(current_stop, be_stop) if signal.direction > 0 else min(current_stop, be_stop)
                 breakeven_activated = True
             if favorable_close >= 1.5 * stop_distance:
                 trail = close_now - signal.direction * 1.2 * atr_now
@@ -150,7 +153,17 @@ def run_backtest(df: pd.DataFrame, strategy: Callable[[pd.Series], StrategySigna
         notional_in = abs(entry * size)
         notional_out = abs(exit_fill * size)
         fees = (notional_in + notional_out) * cfg.fee_bps / 10_000.0
-        net = gross - fees
+        funding_pnl = 0.0
+        if funding_events is not None and not funding_events.empty:
+            entry_ts, exit_ts = df.index[entry_i], df.index[exit_i]
+            events = funding_events[(funding_events.index > entry_ts) & (funding_events.index <= exit_ts)]
+            for funding_ts, event in events.iterrows():
+                # Use the last fully completed market candle strictly before settlement; never a post-settlement price.
+                px_i = int(df.index.searchsorted(funding_ts, side="left")) - 1
+                if px_i >= entry_i:
+                    settlement_proxy = float(df.iloc[px_i]["close"])
+                    funding_pnl += -signal.direction * abs(settlement_proxy * size) * float(event["funding_rate"])
+        net = gross - fees + funding_pnl
         initial_risk = stop_distance * size
         r_multiple = net / initial_risk if initial_risk else np.nan
         equity += net
@@ -167,6 +180,7 @@ def run_backtest(df: pd.DataFrame, strategy: Callable[[pd.Series], StrategySigna
             size=size,
             gross_pnl=gross,
             fees=fees,
+            funding_pnl=funding_pnl,
             net_pnl=net,
             r_multiple=r_multiple,
             reason=reason,
@@ -177,6 +191,7 @@ def run_backtest(df: pd.DataFrame, strategy: Callable[[pd.Series], StrategySigna
             mae_r=max_adverse / stop_distance if stop_distance else np.nan,
             holding_bars=int(exit_i - entry_i + 1),
         ))
+        # One position per strategy: resume after exit, preventing overlapping duplicate trades.
         i = max(exit_i + 1, i + 1)
 
     trades_df = pd.DataFrame([asdict(t) for t in trades])
