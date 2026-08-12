@@ -17,6 +17,7 @@ from .history_policy import normalize_backtest_window
 from .providers import BitgetPublicClient, CoinGlassClient
 from .reporting import save_report
 from .research import SOURCE_LABELS, STRATEGY_SOURCE_REQUIREMENTS, build_strategy_frame, source_status
+from .research_package import build_audit_package, build_research_package
 from .strategies import STRATEGIES
 from .universe import resolve_coinglass_instrument
 from .validation import evaluate_oos
@@ -143,6 +144,8 @@ def command_backtest(args):
         "bitget_funding_events": int(len(funding_events)),
         "strategy_source_requirements": STRATEGY_SOURCE_REQUIREMENTS,
         "funding_model": "exact_published_rate_and_time_with_last_completed_market_candle_price_proxy",
+        "data_selection_policy": "ALL_ELIGIBLE_ROWS_IN_PREDECLARED_WINDOW_NO_OUTCOME_BASED_DATE_OR_SYMBOL_EXCLUSION",
+        "research_tuning_policy": "TRAIN_VALIDATION_AND_DEVELOPMENT_WALK_FORWARD_ONLY_TEST_IS_PROMOTION_ONLY",
         "code_fingerprints": {
             "strategies_py_sha256": _module_sha256(strategies_module),
             "backtest_py_sha256": _module_sha256(backtest_module),
@@ -150,7 +153,7 @@ def command_backtest(args):
         },
     }
 
-    print("COINLAB_STAGE:report:正在產生逐筆交易與可複製回測報告。", flush=True)
+    print("COINLAB_STAGE:report:正在產生逐筆交易、研究包與完整稽核包。", flush=True)
     report = save_report(
         args.out,
         metadata=meta,
@@ -171,9 +174,14 @@ def command_backtest(args):
             "ALL_STRATEGIES_SKIPPED: 所有策略都因資料來源不可用或對齊不足而未執行；"
             f"主要缺少：{joined}。"
         )
+
+    research_package = build_research_package(args.out)
+    audit_package = build_audit_package(args.out)
     skipped = len(STRATEGIES) - len(results)
     print(f"COINLAB_STAGE:done:回測完成：{len(results)} 套策略成功，{skipped} 套因資料完整性不足跳過。", flush=True)
-    print(report.read_text(encoding="utf-8"))
+    print(f"COINLAB_ARTIFACT:report:{report.name}", flush=True)
+    print(f"COINLAB_ARTIFACT:research_package:{research_package.name}", flush=True)
+    print(f"COINLAB_ARTIFACT:audit_package:{audit_package.name}", flush=True)
 
 
 def command_validate(args):
