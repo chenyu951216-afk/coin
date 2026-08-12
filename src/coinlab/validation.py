@@ -29,18 +29,30 @@ def chronological_slices(df: pd.DataFrame, spec: SplitSpec) -> dict[str, pd.Data
     return {"train": df.iloc[:a], "validation": df.iloc[a:b], "test": df.iloc[b:]}
 
 
-def evaluate_oos(df: pd.DataFrame, strategy: Callable[[pd.Series], StrategySignal], cfg: BacktestConfig, spec: SplitSpec = SplitSpec()) -> dict:
+def _funding_for_slice(funding_events: pd.DataFrame | None, part: pd.DataFrame) -> pd.DataFrame | None:
+    if funding_events is None or funding_events.empty or part.empty:
+        return funding_events
+    return funding_events[(funding_events.index > part.index.min()) & (funding_events.index <= part.index.max())]
+
+
+def evaluate_oos(
+    df: pd.DataFrame,
+    strategy: Callable[[pd.Series], StrategySignal],
+    cfg: BacktestConfig,
+    spec: SplitSpec = SplitSpec(),
+    funding_events: pd.DataFrame | None = None,
+) -> dict:
     segments = chronological_slices(df, spec)
     segment_results = {}
     for name, part in segments.items():
-        trades, metrics = run_backtest(part, strategy, cfg)
+        trades, metrics = run_backtest(part, strategy, cfg, funding_events=_funding_for_slice(funding_events, part))
         segment_results[name] = {"metrics": metrics, "trades": trades}
 
     folds = []
     boundaries = np.linspace(0, len(df), spec.walk_forward_folds + 1, dtype=int)
     for k in range(spec.walk_forward_folds):
         part = df.iloc[boundaries[k]:boundaries[k + 1]]
-        _, metrics = run_backtest(part, strategy, cfg)
+        _, metrics = run_backtest(part, strategy, cfg, funding_events=_funding_for_slice(funding_events, part))
         folds.append({
             "fold": k + 1,
             "start": str(part.index.min()) if len(part) else None,
