@@ -10,6 +10,7 @@ import pandas as pd
 
 from . import backtest as backtest_module
 from . import features as features_module
+from . import signal_quality as signal_quality_module
 from . import strategies as strategies_module
 from .backtest import BacktestConfig, run_backtest
 from .config import Settings
@@ -96,6 +97,7 @@ def command_backtest(args):
         risk_per_trade=s.risk_per_trade,
         fee_bps=s.taker_fee_bps,
         slippage_bps=s.slippage_bps,
+        max_estimated_cost_r=s.max_estimated_cost_r,
     )
     results: dict[str, tuple[pd.DataFrame, dict]] = {}
     validation: dict[str, Any] = {}
@@ -137,6 +139,7 @@ def command_backtest(args):
         "risk_per_trade": s.risk_per_trade,
         "taker_fee_bps": s.taker_fee_bps,
         "slippage_bps": s.slippage_bps,
+        "max_estimated_cost_r": s.max_estimated_cost_r,
         "minimum_aligned_coverage": s.min_aligned_coverage,
         "bitget_price_rows": int(len(price)),
         "bitget_price_start": str(price.index.min()) if len(price) else None,
@@ -144,12 +147,15 @@ def command_backtest(args):
         "bitget_funding_events": int(len(funding_events)),
         "strategy_source_requirements": STRATEGY_SOURCE_REQUIREMENTS,
         "funding_model": "exact_published_rate_and_time_with_last_completed_market_candle_price_proxy",
+        "execution_quality_policy": "REJECT_PRETRADE_IF_ESTIMATED_ROUND_TRIP_FEE_PLUS_SLIPPAGE_EXCEEDS_MAX_COST_R",
+        "breakeven_policy": "MOVE_ONLY_AFTER_COMPLETED_BAR_REACHES_1R_AND_USE_FEE_SLIPPAGE_AWARE_TRIGGER",
         "data_selection_policy": "ALL_ELIGIBLE_ROWS_IN_PREDECLARED_WINDOW_NO_OUTCOME_BASED_DATE_OR_SYMBOL_EXCLUSION",
         "research_tuning_policy": "TRAIN_VALIDATION_AND_DEVELOPMENT_WALK_FORWARD_ONLY_TEST_IS_PROMOTION_ONLY",
         "code_fingerprints": {
             "strategies_py_sha256": _module_sha256(strategies_module),
             "backtest_py_sha256": _module_sha256(backtest_module),
             "features_py_sha256": _module_sha256(features_module),
+            "signal_quality_py_sha256": _module_sha256(signal_quality_module),
         },
     }
 
