@@ -1,0 +1,3 @@
+# Zeabur/Nixpacks fallback. The Dockerfile remains the primary deployment path.
+# Installing the project itself ensures the src-layout package `coinlab` is importable.
+-e .
