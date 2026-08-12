@@ -1,101 +1,117 @@
 # CoinGlass × Bitget Strategy Lab
 
-A research-first ETH futures strategy lab designed to **refuse fake backtest numbers**. It downloads real CoinGlass V4 derivatives history and finished Bitget futures candles, aligns them strictly by timestamp, runs multiple strategies without look-ahead, and exports a machine-readable report you can paste back into ChatGPT for review.
+Research-first crypto futures platform for **real-data backtests, multi-symbol Bitget discovery, whole-market strategy scans, and a separated Bitget execution layer**.
 
-## Current strategy set
+The project deliberately refuses to invent backtest metrics. Strategy research uses real CoinGlass derivatives history and Bitget finished futures candles, strict timestamp alignment, no-lookahead execution, fees/slippage/funding, chronological OOS validation, and reproducible reports.
 
-1. `oi_breakout` — price breakout + expanding OI + taker-flow confirmation.
-2. `liquidation_reversal` — liquidation flush exhaustion / reversal.
-3. `funding_crowding` — extreme funding + crowded long/short positioning mean reversion.
-4. `taker_flow_momentum` — aggressive taker imbalance with OI/trend confirmation.
-5. `orderbook_pressure` — historical ±1% bid/ask imbalance with trend/pullback filter.
-6. `oi_divergence` — strong price move while OI contracts, looking for exhaustion.
+## Architecture boundary
 
-These are research hypotheses, **not claimed profitable strategies**. The repo intentionally contains no made-up example PF/win-rate values.
+Two layers are intentionally separated:
 
-## Backtest integrity rules
+- **Strategy layer** — `src/coinlab/strategies.py`, `features.py`, and `backtest.py`. These decide whether a strategy signals and how the current strategy derives initial stop/target behavior.
+- **Exchange layer** — `src/coinlab/exchange.py`. This knows Bitget contracts, quantity/price precision, minimums, account/positions/orders, margin mode, leverage, risk-budget sizing, duplicate-exposure checks, live order submission and exchange-side protection.
 
-- Signal is computed from bar `t` only after it is closed.
-- Earliest entry is bar `t+1` open.
-- No `shift(-1)`/future feature is used to create a signal.
-- CoinGlass and Bitget datasets are joined on exact timestamps; missing derivative bars are not forward-filled into the future.
-- Market entries/exits include configurable slippage and both-side taker fees; positions crossing Bitget funding timestamps also include the published historical funding rate.
-- Position size is based on equity risk and ATR stop distance, not arbitrary leverage.
-- If TP and SL are both touched inside one OHLC bar and no lower-timeframe path is available, the engine uses **stop-first** and records `ambiguous_exit=true`.
-- One strategy cannot stack overlapping positions in the same backtest.
-- Empty/misaligned data aborts the run rather than producing synthetic statistics.
-- The report includes SHA-256 hashes for aligned features and every trades CSV so a run can be reproduced and compared.
+The Bitget exchange adapter must **never improve, widen, tighten, replace, or optimize a strategy-provided entry, stop loss or take profit**. It may only reject an invalid/untradeable order, round quantity **down** to exchange precision, and cap size for account/exchange safety.
 
-## Setup
+## Strategies (unchanged by the exchange upgrade)
 
-```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# macOS/Linux: source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env
-```
+1. `oi_breakout`
+2. `liquidation_reversal`
+3. `funding_crowding`
+4. `taker_flow_momentum`
+5. `orderbook_pressure`
+6. `oi_divergence`
 
-Put your CoinGlass Standard API key in `.env`:
+These remain research hypotheses, not claims of profitability.
+
+## Web dashboard
+
+Deploying the service opens a dashboard at `/` with:
+
+- live Bitget USDT-futures contract search/dropdown;
+- search-as-you-type symbol suggestions (for example `b` can surface BTC/BNB and other matching contracts);
+- selected-symbol real-data backtest launcher;
+- whole-Bitget-market strategy scanner;
+- scanner results with strategy, direction, reference price, current strategy SL/TP and CoinGlass instrument mapping;
+- protected Bitget account/position views;
+- prominent live-trading lock state.
+
+`/docs` remains available for API inspection.
+
+## Whole-market scanner
+
+The scanner does not blindly spend CoinGlass requests on every listed contract:
+
+1. Read current tradable USDT perpetual contracts directly from Bitget.
+2. Read Bitget public tickers.
+3. Filter by minimum 24h USDT turnover and maximum spread.
+4. Resolve only supported symbols to CoinGlass's Bitget instrument id.
+5. Fetch CoinGlass OI, funding, liquidation, long/short, taker flow and orderbook history.
+6. Build the same feature frame used by research.
+7. Run the existing `STRATEGIES` functions on the latest completed-bar feature row.
+8. Return only matching symbol × strategy signals.
+
+The scan is a discovery process; it does not automatically place a live order.
+
+## Backtest integrity
+
+- Signal is computed only after bar `t` closes.
+- Earliest simulated entry is bar `t+1` open.
+- No future feature / negative shift is used to form a signal.
+- CoinGlass and Bitget inputs are timestamp-aligned; missing derivative observations are not filled from the future.
+- Fees, slippage and Bitget funding are included.
+- Same-bar TP+SL ambiguity uses conservative stop-first handling unless lower-timeframe path data is available.
+- Stop management only changes after a completed bar.
+- Empty or materially incomplete data aborts the run instead of generating synthetic performance.
+- Reports include source row counts and SHA-256 fingerprints.
+- Every run includes chronological 60/20/20 train/validation/test plus ordered walk-forward metrics.
+
+## Bitget execution safety
+
+`src/coinlab/exchange.py` uses current Bitget contract metadata for price/size steps, minimum quantity/notional, maximum market/limit quantity and leverage range. Position sizing starts from the configured account-equity loss budget at the **strategy's supplied stop** and then applies position, portfolio, available-margin and Bitget max-open caps. Quantity is rounded down; an order below the exchange minimum is rejected rather than enlarged beyond the risk budget.
+
+Entry orders send the exact strategy-provided SL/TP as Bitget exchange-side preset protection. The adapter also contains a separate TP/SL plan-order method for protection repair/management workflows without deriving new strategy prices.
+
+Live submission has two independent controls:
+
+1. protected API endpoints require `ADMIN_BEARER_TOKEN`;
+2. real order submission additionally requires `LIVE_TRADING_ENABLED=true` and complete Bitget API credentials.
+
+During research keep `LIVE_TRADING_ENABLED=false`.
+
+## Environment
+
+Copy `.env.example` and fill at least `COINGLASS_API_KEY` plus `ADMIN_BEARER_TOKEN` for web-controlled research. Bitget private credentials are unnecessary for public symbol search, scanning, or historical backtesting.
+
+For private account reads add:
 
 ```env
-COINGLASS_API_KEY=your_key_here
+BITGET_API_KEY=...
+BITGET_API_SECRET=...
+BITGET_API_PASSPHRASE=...
 ```
 
-Keep `LIVE_TRADING_ENABLED=false` during strategy research.
+Do not commit secrets. If an older repository ever committed a real `.env`, rotate those credentials rather than reusing them.
 
-## Run a real backtest
+## Zeabur
+
+A deterministic `Dockerfile` is included. It installs the package and runs:
+
+```text
+python main.py
+```
+
+The application listens on `0.0.0.0:$PORT` (default 8080), which avoids relying on a platform guess about the entry file.
+
+## Tests
 
 ```bash
-coinlab backtest --out artifacts/eth_15m_run_001
+pip install -e '.[dev]'
+pytest -q
 ```
 
-Output:
+The exchange-layer tests verify normalization, risk-budget sizing, downward quantity rounding, rejection below Bitget minimums, correct market-vs-limit max quantity handling, and exclusion of reduce-only orders from portfolio exposure.
 
-- `BACKTEST_REPORT.json` — paste this whole file into ChatGPT when you want strategy changes.
-- `aligned_features.csv` — exact aligned input used by the engine.
-- `trades_<strategy>.csv` — complete trades, fills, fees, R, exit reason and ambiguous-fill flags.
+## Backtest report to send to ChatGPT
 
-The report is deliberately compact enough for iterative analysis while trade CSVs remain available for deeper debugging.
-
-## What to send back to ChatGPT
-
-The best artifact is `BACKTEST_REPORT.json`. If one strategy behaves strangely, also send its `trades_<strategy>.csv`.
-
-Useful review request:
-
-> Review this CoinLab BACKTEST_REPORT.json. Do not optimize on the full sample. Diagnose each strategy using trade count, PF, expectancy R, max drawdown, consecutive losses and ambiguous-exit count. Propose changes that can be validated out-of-sample and preserve the no-lookahead rules.
-
-## Live Bitget execution
-
-`BitgetTradeClient` already implements authenticated futures order signing and `POST /api/v2/mix/order/place-order`. Live trading is intentionally **not wired to strategy signals yet**. That should only be enabled after walk-forward/out-of-sample validation and paper trading.
-
-Never commit API keys. Use environment variables/secrets on Zeabur or your server.
-
-## Important next research steps
-
-The first version prioritizes correctness and auditability. Before real money, add:
-
-- parameter search that tunes only on train/validation and keeps the final test set untouched;
-- 1m sub-bar execution data for resolving same-bar TP/SL instead of conservative stop-first;
-- latency/spread model calibrated from live Bitget data;
-- paper-trading shadow mode before any live-order switch.
-
-## Out-of-sample / anti-overfit validation
-
-Every run also produces chronological **60% train / 20% validation / 20% test** metrics plus five time-ordered walk-forward folds. The strategy rules are frozen before the test segment; the test segment is not used to tune thresholds in this version.
-
-Each strategy receives a transparent research grade:
-
-- `INSUFFICIENT_OOS_TRADES` — fewer than 30 test trades.
-- `REJECT_OOS` — test PF <= 1 or test expectancy <= 0R.
-- `PROMISING_RESEARCH_CANDIDATE` — positive validation expectancy, positive test edge and at least 60% profitable usable walk-forward folds.
-- `NEEDS_MORE_VALIDATION` — not rejected, but consistency is not strong enough yet.
-
-This grade is a research filter, not a promise of future profit.
-
-### Adaptive exits
-
-Initial risk uses the farther of strategy ATR risk and a confirmed 12-bar swing structure, capped at 3.5 ATR to avoid a distant wick creating tiny position size. Stop management is close-confirmed: after a bar **closes** at +1R the stop may move to breakeven for the next bar; after a close at +1.5R an ATR trail may tighten for later bars. The engine never retroactively moves a stop inside the same candle.
-
-Trade CSVs also include funding PnL, MFE-R, MAE-R, holding bars, breakeven activation, trailing activation and ambiguous exits, which makes later strategy diagnosis much more useful than win rate alone.
+After a run, send `BACKTEST_REPORT.json`. If one strategy looks abnormal, also send its `trades_<strategy>.csv`. Do not optimize based only on the full-sample result; inspect OOS test and walk-forward consistency first.

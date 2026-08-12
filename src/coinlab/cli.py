@@ -14,6 +14,7 @@ from .features import build_feature_frame
 from .providers import BitgetPublicClient, CoinGlassClient
 from .reporting import save_report
 from .strategies import STRATEGIES
+from .universe import resolve_coinglass_instrument
 from .validation import evaluate_oos
 
 
@@ -21,10 +22,28 @@ def _module_sha256(module) -> str:
     return hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
 
 
+def _resolved_coinglass_symbol(s: Settings) -> str:
+    configured = str(s.coinglass_symbol or "").strip()
+    if configured and configured.upper() != "AUTO":
+        return configured
+    return resolve_coinglass_instrument(
+        s.coinglass_api_key,
+        s.coinglass_exchange,
+        s.symbol,
+    )
+
+
 def fetch_and_build(s: Settings):
+    cg_symbol = _resolved_coinglass_symbol(s)
     cg = CoinGlassClient(s.coinglass_api_key)
-    bg = BitgetPublicClient()
-    common = dict(exchange=s.coinglass_exchange, symbol=s.coinglass_symbol, interval=s.timeframe, start=s.start, end=s.end)
+    bg = BitgetPublicClient(base_url=s.bitget_rest_base_url)
+    common = dict(
+        exchange=s.coinglass_exchange,
+        symbol=cg_symbol,
+        interval=s.timeframe,
+        start=s.start,
+        end=s.end,
+    )
     granularity = s.timeframe.replace("h", "H") if s.timeframe.endswith("h") else s.timeframe
     price = bg.candles(s.symbol, granularity, s.start, s.end)
     if price.empty:
@@ -40,8 +59,18 @@ def fetch_and_build(s: Settings):
     missing = [k for k, v in datasets.items() if v.empty]
     if missing:
         raise RuntimeError(f"CoinGlass returned empty required datasets: {missing}. Backtest aborted for integrity.")
-    features = build_feature_frame(price, datasets["oi"], datasets["funding"], datasets["liq"], datasets["ls"], datasets["taker"], datasets["orderbook"])
+    features = build_feature_frame(
+        price,
+        datasets["oi"],
+        datasets["funding"],
+        datasets["liq"],
+        datasets["ls"],
+        datasets["taker"],
+        datasets["orderbook"],
+    )
     stats = {
+        "bitget_symbol": s.symbol,
+        "resolved_coinglass_symbol": cg_symbol,
         "bitget_price_rows": int(len(price)),
         "coinglass_rows": {k: int(len(v)) for k, v in datasets.items()},
         "aligned_rows": int(len(features)),
@@ -72,7 +101,8 @@ def command_backtest(args):
     validation = {name: evaluate_oos(df, fn, cfg, funding_events=funding_events) for name, fn in STRATEGIES.items()}
     meta = {
         "symbol": s.symbol,
-        "coinglass_symbol": s.coinglass_symbol,
+        "coinglass_symbol": source_stats["resolved_coinglass_symbol"],
+        "coinglass_symbol_setting": s.coinglass_symbol,
         "coinglass_exchange": s.coinglass_exchange,
         "timeframe": s.timeframe,
         "requested_start": s.start,
