@@ -1,0 +1,86 @@
+name: manual-real-data-backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'UTC start, e.g. 2025-01-01T00:00:00Z'
+        required: true
+        default: '2025-01-01T00:00:00Z'
+      end:
+        description: 'UTC end, e.g. 2026-01-01T00:00:00Z'
+        required: true
+        default: '2026-01-01T00:00:00Z'
+      timeframe:
+        description: 'CoinGlass/strategy timeframe: 1m,3m,5m,15m,30m,1h,4h...'
+        required: true
+        default: '15m'
+      coinglass_exchange:
+        description: 'CoinGlass derivatives source exchange'
+        required: true
+        default: 'Binance'
+      risk_per_trade:
+        description: 'Equity risk fraction per trade'
+        required: true
+        default: '0.01'
+      taker_fee_bps:
+        description: 'Your actual round-leg taker fee in basis points per fill'
+        required: true
+        default: '6'
+      slippage_bps:
+        description: 'Assumed adverse slippage per fill in basis points'
+        required: true
+        default: '2'
+      min_aligned_coverage:
+        description: 'Abort below this source alignment coverage'
+        required: true
+        default: '0.90'
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      COINGLASS_API_KEY: ${{ secrets.COINGLASS_API_KEY }}
+      COINGLASS_EXCHANGE: ${{ inputs.coinglass_exchange }}
+      COINGLASS_SYMBOL: ETHUSDT
+      SYMBOL: ETHUSDT
+      TIMEFRAME: ${{ inputs.timeframe }}
+      START: ${{ inputs.start }}
+      END: ${{ inputs.end }}
+      INITIAL_EQUITY: '10000'
+      RISK_PER_TRADE: ${{ inputs.risk_per_trade }}
+      TAKER_FEE_BPS: ${{ inputs.taker_fee_bps }}
+      SLIPPAGE_BPS: ${{ inputs.slippage_bps }}
+      MIN_ALIGNED_COVERAGE: ${{ inputs.min_aligned_coverage }}
+      LIVE_TRADING_ENABLED: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: Integrity tests
+        run: pytest -q
+      - name: Refuse missing CoinGlass secret
+        shell: bash
+        run: |
+          if [ -z "$COINGLASS_API_KEY" ]; then
+            echo 'Missing repository Actions secret: COINGLASS_API_KEY'
+            exit 1
+          fi
+      - name: Run real-data backtest
+        run: coinlab backtest --out artifacts/github_run
+      - name: Upload reproducible report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coinlab-backtest-${{ github.run_id }}
+          path: artifacts/github_run/
+          if-no-files-found: warn
+          retention-days: 30
