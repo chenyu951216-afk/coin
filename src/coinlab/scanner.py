@@ -9,6 +9,7 @@ import pandas as pd
 from .exchange import BitgetV2Client
 from .providers import BitgetPublicClient, CoinGlassClient
 from .research import SOURCE_LABELS, build_strategy_frame, source_status, strategy_requirements
+from .signal_quality import estimated_round_trip_cost_r
 from .strategies import STRATEGIES, StrategySignal
 from .universe import get_coinglass_exchange_pairs, resolve_coinglass_instrument
 
@@ -29,6 +30,9 @@ class ScanConfig:
     max_spread_pct: float = 0.50
     max_symbols: int = 0
     coinglass_exchange: str = "Bitget"
+    fee_bps: float = 6.0
+    slippage_bps: float = 2.0
+    max_estimated_cost_r: float = 0.18
 
 
 def _iso(ts: datetime) -> str:
@@ -150,6 +154,7 @@ def scan_market(
     skipped_symbols: list[dict[str, Any]] = []
     source_fail_counts = {name: 0 for name in SOURCE_LABELS}
     strategy_skip_counts = {name: 0 for name in STRATEGIES}
+    cost_rejected_signals = 0
 
     for i, candidate in enumerate(candidates, 1):
         if should_stop and should_stop():
@@ -157,6 +162,7 @@ def scan_market(
                 "status": "paused", "timeframe": cfg.timeframe, "window": {"start": start, "end": end},
                 "stats": {**stats, "evaluated": i - 1, "matched_signals": len(matches),
                           "matched_symbols": len({m["symbol"] for m in matches}),
+                          "cost_rejected_signals": cost_rejected_signals,
                           "source_fail_counts": source_fail_counts, "strategy_skip_counts": strategy_skip_counts},
                 "matches": matches, "skipped": skipped_symbols[:100],
             }
@@ -218,8 +224,17 @@ def scan_market(
                 signal = fn(usable.iloc[-1])
                 if signal.direction == 0:
                     continue
-                symbol_matched = True
                 levels = derive_strategy_levels(frame, signal)
+                estimated_cost_r = estimated_round_trip_cost_r(
+                    entry=levels["entry"],
+                    stop=levels["stop_loss"],
+                    fee_bps=cfg.fee_bps,
+                    slippage_bps=cfg.slippage_bps,
+                )
+                if cfg.max_estimated_cost_r > 0 and estimated_cost_r > cfg.max_estimated_cost_r:
+                    cost_rejected_signals += 1
+                    continue
+                symbol_matched = True
                 signal_time = str(frame.index[-1])
                 direction = "long" if signal.direction > 0 else "short"
                 matches.append({
@@ -229,7 +244,7 @@ def scan_market(
                     "signal_time": signal_time, "reference_price": levels["entry"],
                     "stop_loss": levels["stop_loss"], "stop_pct": levels["stop_pct"],
                     "take_profit": levels["take_profit"], "take_profit_pct": levels["take_profit_pct"],
-                    "reward_r": signal.reward_r, "atr": levels["atr"],
+                    "reward_r": signal.reward_r, "estimated_cost_r": estimated_cost_r, "atr": levels["atr"],
                     "volume_24h_usdt": candidate.get("volume_24h_usdt"), "spread_pct": candidate.get("spread_pct"),
                     "coinglass_exchange": cfg.coinglass_exchange, "coinglass_instrument": cg_symbol,
                     "aligned_rows": len(frame), "data_window_start": diagnostic.get("common_start"),
@@ -251,7 +266,7 @@ def scan_market(
         "status": "completed", "timeframe": cfg.timeframe, "window": {"start": start, "end": end},
         "stats": {**stats, "evaluated": len(candidates), "matched_signals": len(matches),
                   "matched_symbols": len({m["symbol"] for m in matches}), "no_signal_symbols": len(no_signal),
-                  "skipped_symbols": len(skipped_symbols), "source_fail_counts": source_fail_counts,
-                  "strategy_skip_counts": strategy_skip_counts},
+                  "skipped_symbols": len(skipped_symbols), "cost_rejected_signals": cost_rejected_signals,
+                  "source_fail_counts": source_fail_counts, "strategy_skip_counts": strategy_skip_counts},
         "matches": matches, "skipped": skipped_symbols[:100],
     }
