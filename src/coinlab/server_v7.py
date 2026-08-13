@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-import json
 import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import server_v5 as v6
+from .backtest import compute_metrics
 from .config import Settings
-from .market_backtest import MarketBacktestConfig, run_market_backtest
+from .market_backtest import MarketBacktestConfig, _portfolio_exposure, run_market_backtest
 
 
 app = FastAPI(
@@ -63,16 +64,25 @@ def _detail(title: str, message: str, action: str = "") -> dict[str, str]:
     return v6.v4._detail(title, message, action)
 
 
+def _development_summary(outdir: Path, initial_equity: float) -> dict[str, Any]:
+    path = outdir / "development_market_trades.csv"
+    if not path.exists() or path.stat().st_size == 0:
+        empty = pd.DataFrame()
+        return {**compute_metrics(empty, initial_equity), **_portfolio_exposure(empty)}
+    try:
+        trades = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        trades = pd.DataFrame()
+    ordered = trades.sort_values("exit_time") if not trades.empty and "exit_time" in trades else trades
+    return {**compute_metrics(ordered, initial_equity), **_portfolio_exposure(trades)}
+
+
 def _run_market_job(run_id: str, outdir: Path, req: MarketBacktestRequest) -> None:
     global _market_job
     s = Settings()
     cfg = MarketBacktestConfig(
         timeframe=req.timeframe,
-        min_historical_24h_turnover_usdt=(
-            s.market_backtest_min_24h_turnover_usdt
-            if req.min_historical_24h_turnover_usdt is None
-            else req.min_historical_24h_turnover_usdt
-        ),
+        min_historical_24h_turnover_usdt=(s.market_backtest_min_24h_turnover_usdt if req.min_historical_24h_turnover_usdt is None else req.min_historical_24h_turnover_usdt),
         max_symbols=s.market_backtest_max_symbols if req.max_symbols is None else req.max_symbols,
         fee_bps=s.taker_fee_bps,
         slippage_bps=s.slippage_bps,
@@ -105,7 +115,7 @@ def _run_market_job(run_id: str, outdir: Path, req: MarketBacktestRequest) -> No
             _market_job["message"] = f"正在處理 {symbol}（{current}/{total}）· {stage}。這是全市場真實資料工作，可能需要較久。"
 
     try:
-        report = run_market_backtest(
+        run_market_backtest(
             coinglass_api_key=s.coinglass_api_key,
             requested_start=s.start,
             requested_end=s.end,
@@ -120,14 +130,14 @@ def _run_market_job(run_id: str, outdir: Path, req: MarketBacktestRequest) -> No
             _market_job["finished_at"] = datetime.now(timezone.utc).isoformat()
             if _market_stop.is_set():
                 _market_job["state"] = "stopped"
-                _market_job["message"] = "全市場回測已停止。已取得的快取資料會保留，下次重新跑可重用。"
+                _market_job["message"] = "全市場回測已停止。已取得的真實資料快取會保留，下次可重用。"
                 return
-            summary = report.get("portfolio_summary") or {}
+            summary = _development_summary(outdir, s.initial_equity)
             _market_job["state"] = "completed"
             _market_job["summary"] = summary
             _market_job["message"] = (
-                f"全市場回測完成：{int(summary.get('trades') or 0)} 筆模擬單，"
-                f"淨損益 {float(summary.get('net_pnl') or 0):,.2f} U。每筆交易已寫入 CSV。"
+                f"全市場回測完成。開發期 Train+Validation 有 {int(summary.get('trades') or 0)} 筆模擬單，"
+                f"淨損益 {float(summary.get('net_pnl') or 0):,.2f} U。Locked Test 沒有顯示在一般頁面。"
             )
             _market_job["error"] = None
     except Exception as exc:
@@ -145,7 +155,7 @@ def _run_market_job(run_id: str, outdir: Path, req: MarketBacktestRequest) -> No
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "version": "0.7.0", "market_wide_backtest": True, "fixed_paper_notional": True}
+    return {"ok": True, "version": "0.7.0", "market_wide_backtest": True, "fixed_paper_notional": True, "locked_test_hidden_from_ui": True}
 
 
 @app.post("/api/market-backtest/start", dependencies=[Depends(_admin)])
@@ -192,13 +202,12 @@ def _market_file(kind: str) -> Path:
         output = _market_job.get("output_dir")
         state = _market_job.get("state")
     if not output or state != "completed":
-        raise HTTPException(status_code=409, detail=_detail("全市場回測尚未完成", "完成後才能下載研究包。"))
+        raise HTTPException(status_code=409, detail=_detail("全市場回測尚未完成", "完成後才能下載研究檔。"))
     root = Path(output)
     patterns = {
         "research": "COINLAB_MARKET_RESEARCH_*.zip",
         "audit": "COINLAB_MARKET_AUDIT_*.zip",
-        "trades": "all_market_trades.csv",
-        "report": "MARKET_BACKTEST_REPORT.json",
+        "trades": "development_market_trades.csv",
     }
     pattern = patterns[kind]
     matches = sorted(root.glob(pattern)) if "*" in pattern else [root / pattern]
@@ -226,29 +235,24 @@ def market_trades_download() -> FileResponse:
     return FileResponse(p, media_type="text/csv", filename=p.name)
 
 
-# Replace only the old single-symbol card. Keeping btTf/btStart/btEnd/btRisk IDs
-# preserves the already-tested date-policy boot JS without using the old start action.
 _new_market_card = r'''<section class="card c6"><h2>Bitget 全市場歷史真實回測</h2>
-<div class="notice">不再只回測目前選擇的單一幣。系統會依這段歷史時間，逐一檢查 Bitget 可研究合約；歷史交易資格只看當時以前已收 K 的 24h 成交額，不用今天成交額回頭選過去贏家。</div>
-<div class="notice">模擬名目固定：進場當下市場價格 &gt; 50U → 20,000U；≤ 50U → 2,000U。所有實際模擬單都會誠實寫入 all_market_trades.csv。</div>
+<div class="notice">不再只回測目前選擇的單一幣。系統會依歷史時間逐一檢查可研究合約；歷史交易資格只看當時以前已收 K 的 24h 成交額，不用今天成交額回頭選過去贏家。</div>
+<div class="notice">模擬名目固定：進場當下市場價格 &gt; 50U → 20,000U；≤ 50U → 2,000U。一般頁面與研究包只顯示 Train+Validation；Locked Test 只留在完整稽核包。</div>
 <div class="row"><div><label>自動開始 UTC</label><input id="btStart" readonly></div><div><label>自動結束 UTC</label><input id="btEnd" readonly></div></div>
 <div class="row"><div><label>Timeframe</label><select id="btTf"><option>5m</option><option selected>15m</option><option>30m</option><option>1h</option><option>4h</option></select></div><div><label>歷史 24h 最低成交額 U</label><input id="marketTurnover" type="number" value="1000000"></div><div><label>最多幣種（0=全部）</label><input id="marketMaxSymbols" type="number" value="0" min="0"></div></div>
 <input id="btRisk" class="hidden" value="0.01">
 <div class="row" style="margin-top:12px"><button id="marketBtBtn" class="primary" onclick="startMarketBacktest()">開始全市場完整回測</button><button class="pause" onclick="stopMarketBacktest()">停止回測</button></div>
 <div id="btStatus" class="status"><div class="status-title">尚未開始</div><div>日期會依 CoinGlass Standard 自動選滿可用範圍。</div></div>
 <div id="marketSummary" class="notice hidden"></div>
-<div class="row" style="margin-top:9px"><button id="marketResearchBtn" class="hidden primary" onclick="downloadMarket('/api/market-backtest/download/research')">下載全市場研究包 ZIP（傳給 ChatGPT）</button><button id="marketTradesBtn" class="hidden" onclick="downloadMarket('/api/market-backtest/download/trades')">下載全部逐筆交易 CSV</button><button id="marketAuditBtn" class="hidden" onclick="downloadMarket('/api/market-backtest/download/audit')">下載完整稽核包 ZIP</button></div>
+<div class="row" style="margin-top:9px"><button id="marketResearchBtn" class="hidden primary" onclick="downloadMarket('/api/market-backtest/download/research')">下載全市場研究包 ZIP（傳給 ChatGPT）</button><button id="marketTradesBtn" class="hidden" onclick="downloadMarket('/api/market-backtest/download/trades')">下載開發期逐筆交易 CSV</button><button id="marketAuditBtn" class="hidden" onclick="downloadMarket('/api/market-backtest/download/audit')">完整稽核包（含 Locked Test，凍結策略才看）</button></div>
 </section>'''
 
 DASHBOARD = v6.DASHBOARD
 DASHBOARD = DASHBOARD.replace("Strategy Lab v0.6", "Strategy Lab v0.7")
-DASHBOARD = DASHBOARD.replace("v0.6 · 成本感知 · 多幣種", "v0.7 · 全市場真實回測 · 固定名目 · 無未來資料")
+DASHBOARD = DASHBOARD.replace("v0.6 · 成本感知 · 多幣種", "v0.7 · 全市場真實回測 · 固定名目 · Locked Test 隔離")
 DASHBOARD = re.sub(
     r'<section class="card c6"><h2>單幣種真實資料回測</h2>.*?</section>(?=\s*<section class="card c6"><h2>Bitget 全市場自動掃描</h2>)',
-    _new_market_card,
-    DASHBOARD,
-    count=1,
-    flags=re.S,
+    _new_market_card, DASHBOARD, count=1, flags=re.S,
 )
 
 _market_js = r'''
@@ -257,7 +261,7 @@ async function startMarketBacktest(){
   $('marketResearchBtn').classList.add('hidden');$('marketTradesBtn').classList.add('hidden');$('marketAuditBtn').classList.add('hidden');$('marketSummary').classList.add('hidden');
   try{
     await jfetch('/api/market-backtest/start',{method:'POST',headers:headers(),body:JSON.stringify({timeframe:$('btTf').value,min_historical_24h_turnover_usdt:Number($('marketTurnover').value),max_symbols:Number($('marketMaxSymbols').value)})});
-    showStatus('btStatus','全市場回測已開始','正在建立歷史 universe 並逐幣下載真實資料。','全部幣種可能需要較長時間；系統會顯示進度。','warn');
+    showStatus('btStatus','全市場回測已開始','正在逐幣下載並模擬真實歷史資料。','全部幣種可能需要較長時間；系統會顯示目前進度。','warn');
     if(marketTimer)clearInterval(marketTimer);marketTimer=setInterval(pollMarketBacktest,2500);await pollMarketBacktest();
   }catch(e){showErr('btStatus',e)}
 }
@@ -268,8 +272,8 @@ async function pollMarketBacktest(){
     if(x.state==='running'){showStatus('btStatus','全市場回測進行中',x.message||'處理中…',p.total?`進度 ${p.current||0} / ${p.total} · ${p.symbol||''}`:'正在建立 universe','warn');return}
     if(x.state==='completed'){
       if(marketTimer){clearInterval(marketTimer);marketTimer=null}const s=x.summary||{};
-      showStatus('btStatus','全市場回測完成',x.message||'完成。','請下載研究包傳給 ChatGPT；不要貼大型 JSON。','good');
-      $('marketSummary').classList.remove('hidden');$('marketSummary').innerHTML=`模擬交易：<b>${fmt(s.trades,0)}</b>　淨損益：<b class="${pnlClass(s.net_pnl)}">${fmt(s.net_pnl,2)} U</b>　PF：<b>${fmt(s.profit_factor,3)}</b>　期望R：<b>${fmt(s.expectancy_r,3)}</b>　峰值同時單數：<b>${fmt(s.peak_open_tickets,0)}</b>　峰值總名目：<b>${fmt(s.peak_gross_notional_usdt,0)} U</b>`;
+      showStatus('btStatus','全市場回測完成 · Locked Test 已隱藏',x.message||'完成。','平常只下載研究包；完整稽核包等策略候選凍結後再看。','good');
+      $('marketSummary').classList.remove('hidden');$('marketSummary').innerHTML=`開發期模擬交易：<b>${fmt(s.trades,0)}</b>　開發期淨損益：<b class="${pnlClass(s.net_pnl)}">${fmt(s.net_pnl,2)} U</b>　PF：<b>${fmt(s.profit_factor,3)}</b>　期望R：<b>${fmt(s.expectancy_r,3)}</b>　峰值同時單數：<b>${fmt(s.peak_open_tickets,0)}</b>　峰值總名目：<b>${fmt(s.peak_gross_notional_usdt,0)} U</b>`;
       $('marketResearchBtn').classList.remove('hidden');$('marketTradesBtn').classList.remove('hidden');$('marketAuditBtn').classList.remove('hidden');return
     }
     if(x.state==='failed'){if(marketTimer){clearInterval(marketTimer);marketTimer=null}showErr('btStatus',new FriendlyError(x.error||{title:'全市場回測沒有完成',message:x.message||'資料處理失敗。'}));return}
