@@ -7,6 +7,13 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
+from .position_sizing import (
+    HIGH_PRICE_NOTIONAL_USDT,
+    HIGH_PRICE_THRESHOLD_USDT,
+    LOW_PRICE_NOTIONAL_USDT,
+    paper_notional_for_price,
+    sizing_tier_for_price,
+)
 from .signal_quality import cost_aware_breakeven_trigger, estimated_round_trip_cost_r, signal_snapshot
 from .strategies import StrategySignal
 
@@ -14,16 +21,16 @@ from .strategies import StrategySignal
 @dataclass
 class BacktestConfig:
     initial_equity: float = 10_000.0
+    # Retained for API compatibility only. Simulation sizing is now fixed-notional.
     risk_per_trade: float = 0.01
     fee_bps: float = 6.0
     slippage_bps: float = 2.0
     max_holding_bars: int = 48
     ambiguous_policy: str = "stop_first"
-    # Development evidence on both ETH 15m and 30m showed that setups whose
-    # estimated round-trip execution cost consumes a large part of initial R
-    # are structurally fragile. This is a pre-trade economics gate, not an
-    # outcome/date/symbol filter.
     max_estimated_cost_r: float = 0.18
+    paper_low_notional_usdt: float = LOW_PRICE_NOTIONAL_USDT
+    paper_high_notional_usdt: float = HIGH_PRICE_NOTIONAL_USDT
+    paper_high_price_threshold: float = HIGH_PRICE_THRESHOLD_USDT
 
 
 @dataclass
@@ -45,8 +52,12 @@ class Trade:
     target_pct: float
     planned_reward_r: float
     estimated_cost_r: float
+    sizing_tier: str
+    planned_notional_usdt: float
     size: float
     entry_notional: float
+    planned_stop_risk_usdt: float
+    # Legacy-compatible alias. It now means planned stop risk, not equity-percent budget.
     risk_budget_usdt: float
     initial_risk_usdt: float
     equity_before: float
@@ -67,9 +78,6 @@ class Trade:
     mfe_r: float
     mae_r: float
     holding_bars: int
-    # Only values available on the completed signal bar. This lets future
-    # research diagnose reusable conditions without reconstructing or peeking
-    # at anything after the entry decision.
     signal_features: dict[str, Any]
 
 
@@ -120,7 +128,9 @@ def run_backtest(
             continue
         signals_seen += 1
 
-        # STRICT NO-LOOKAHEAD: signal is known only after close[i]; entry is open[i+1].
+        # NO LOOKAHEAD: signal exists only after close[i]. Entry is open[i+1].
+        # At the instant open[i+1] exists, that market price is legitimately known
+        # and is therefore also the price used to select the fixed-notional tier.
         entry_i = i + 1
         entry_raw = float(df.iloc[entry_i]["open"])
         entry = _fill_entry(entry_raw, signal.direction, cfg.slippage_bps)
@@ -130,7 +140,7 @@ def run_backtest(
             i += 1
             continue
 
-        # Initial stop uses only structure already confirmed by the signal close.
+        # Stop structure uses only bars completed by the signal timestamp.
         lookback = df.iloc[max(0, i - 11): i + 1]
         if signal.direction > 0:
             structure_stop = float(lookback["low"].min()) - 0.15 * atr
@@ -148,8 +158,6 @@ def run_backtest(
             i += 1
             continue
 
-        # Pre-trade cost gate: if realistic two-sided fee+slippage is already too
-        # large relative to 1R, the setup does not have enough economic room.
         estimated_cost_r = estimated_round_trip_cost_r(
             entry=entry,
             stop=initial_stop,
@@ -163,13 +171,22 @@ def run_backtest(
 
         target = entry + signal.direction * stop_distance * signal.reward_r
 
-        equity_before = equity
-        risk_budget = max(equity_before, 0.0) * cfg.risk_per_trade
-        size = risk_budget / stop_distance
+        planned_notional = paper_notional_for_price(
+            entry_raw,
+            low_notional=cfg.paper_low_notional_usdt,
+            high_notional=cfg.paper_high_notional_usdt,
+            threshold=cfg.paper_high_price_threshold,
+        )
+        tier = sizing_tier_for_price(entry_raw, threshold=cfg.paper_high_price_threshold)
+        # Size off the actual adverse-slippage entry fill so entry notional equals
+        # the predeclared 2,000U / 20,000U target as closely as possible.
+        size = planned_notional / entry
         if size <= 0 or not math.isfinite(size):
             i += 1
             continue
 
+        planned_stop_risk = stop_distance * size
+        equity_before = equity
         exit_i = min(entry_i + cfg.max_holding_bars, n - 1)
         exit_trigger = float(df.iloc[exit_i]["close"])
         reason = "time_exit"
@@ -204,14 +221,12 @@ def run_backtest(
                 exit_trigger, exit_i, reason = target, j, "target"
                 break
 
-            # Any stop change happens only after this bar closes and therefore affects later bars only.
+            # Stop changes are computed only after this completed bar and can
+            # affect later bars only. No intrabar hindsight is allowed.
             close_now = float(bar.close)
             atr_now = float(bar.atr14) if np.isfinite(bar.atr14) else atr
             favorable_close = (close_now - entry) * signal.direction
             if favorable_close >= stop_distance:
-                # Keep the original 1R activation timing, but move to a fee/slippage
-                # aware breakeven trigger instead of raw entry, so a "breakeven"
-                # stop is not systematically a net loser after costs.
                 be_trigger = cost_aware_breakeven_trigger(
                     entry_fill=entry,
                     direction=signal.direction,
@@ -238,7 +253,7 @@ def run_backtest(
             entry_ts, exit_ts = df.index[entry_i], df.index[exit_i]
             events = funding_events[(funding_events.index > entry_ts) & (funding_events.index <= exit_ts)]
             for funding_ts, event in events.iterrows():
-                # Strictly use the last completed candle BEFORE funding settlement.
+                # Strictly use the last completed candle BEFORE settlement.
                 px_i = int(df.index.searchsorted(funding_ts, side="left")) - 1
                 if px_i >= entry_i:
                     settlement_proxy = float(df.iloc[px_i]["close"])
@@ -267,9 +282,12 @@ def run_backtest(
             target_pct=abs(target - entry) / entry if entry else np.nan,
             planned_reward_r=signal.reward_r,
             estimated_cost_r=estimated_cost_r,
+            sizing_tier=tier,
+            planned_notional_usdt=planned_notional,
             size=size,
             entry_notional=entry_notional,
-            risk_budget_usdt=risk_budget,
+            planned_stop_risk_usdt=planned_stop_risk,
+            risk_budget_usdt=planned_stop_risk,
             initial_risk_usdt=initial_risk,
             equity_before=equity_before,
             equity_after=equity,
@@ -292,7 +310,7 @@ def run_backtest(
             signal_features=signal_snapshot(signal_row),
         ))
 
-        # One position per strategy. Resume only after this position is closed.
+        # One open position per strategy instance. Resume only after it closes.
         i = max(exit_i + 1, i + 1)
 
     trades_df = pd.DataFrame([asdict(t) for t in trades])
@@ -303,6 +321,10 @@ def run_backtest(
     metrics["signals_rejected_cost"] = int(signals_rejected_cost)
     metrics["cost_rejection_rate"] = float(signals_rejected_cost / signals_seen) if signals_seen else None
     metrics["max_estimated_cost_r"] = float(cfg.max_estimated_cost_r)
+    metrics["sizing_mode"] = "FIXED_NOTIONAL_BY_ENTRY_PRICE"
+    metrics["paper_low_notional_usdt"] = float(cfg.paper_low_notional_usdt)
+    metrics["paper_high_notional_usdt"] = float(cfg.paper_high_notional_usdt)
+    metrics["paper_high_price_threshold"] = float(cfg.paper_high_price_threshold)
     return trades_df, metrics
 
 
