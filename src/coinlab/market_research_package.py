@@ -9,12 +9,7 @@ import pandas as pd
 
 
 def install_strict_market_packager() -> None:
-    """Replace the market packager with a stricter development-only version.
-
-    The research ZIP contains only the explicit train and validation windows.
-    Purge/embargo gaps and locked test trades are excluded so they cannot leak
-    into iterative strategy tuning.
-    """
+    """Replace market packaging with strict train+validation-only research files."""
     from . import market_backtest as mb
     from .backtest import compute_metrics
 
@@ -26,7 +21,11 @@ def install_strict_market_packager() -> None:
         dev = pd.concat([train, valid], ignore_index=True) if (not train.empty or not valid.empty) else trades.iloc[:0].copy()
         if not dev.empty:
             dev = dev.sort_values(["entry_time", "symbol", "strategy"]).reset_index(drop=True)
+        dev_path = root / "development_market_trades.csv"
+        dev.to_csv(dev_path, index=False)
+
         initial = report["metadata"]["initial_equity"]
+        development_metrics = compute_metrics(dev.sort_values("exit_time") if not dev.empty else dev, initial)
         research_payload = {
             "schema_version": "coinlab.market_research.v2",
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -40,18 +39,20 @@ def install_strict_market_packager() -> None:
                 "locked_test_start": split.test_start, "locked_test_end": split.test_end,
                 "embargo_seconds": split.embargo_seconds,
             },
+            "development_metrics": development_metrics,
             "train_metrics": compute_metrics(train.sort_values("exit_time") if not train.empty else train, initial),
             "validation_metrics": compute_metrics(valid.sort_values("exit_time") if not valid.empty else valid, initial),
             "development_walk_forward": mb._fold_metrics(dev, split.train_start, split.validation_end, 5, initial),
             "by_strategy_development": mb._summary_group(dev, "strategy", initial),
             "by_symbol_development": mb._summary_group(dev, "symbol", initial),
+            "development_exposure": mb._portfolio_exposure(dev),
             "development_trade_count": int(len(dev)),
             "excluded_from_tuning": ["PURGE_EMBARGO_GAPS", "LOCKED_TEST_HOLDOUT"],
             "important": "Only explicit train+validation trades are included. Embargo gaps and locked test are excluded. Never delete a date/symbol/trade because its realized PnL was bad.",
         }
         with ZipFile(research, "w", ZIP_DEFLATED, compresslevel=9) as z:
             z.writestr("CHATGPT_MARKET_RESEARCH_INPUT.json", json.dumps(mb._json_safe(research_payload), ensure_ascii=False, indent=2, sort_keys=True).encode())
-            z.writestr("trades_development_all_symbols.csv", dev.to_csv(index=False).encode("utf-8-sig") if not dev.empty else b"")
+            z.write(dev_path, "development_market_trades.csv")
             z.writestr("skipped_symbols.csv", pd.DataFrame(report.get("skipped_symbols", [])).to_csv(index=False).encode("utf-8-sig"))
             z.writestr("README_研究規則.txt", (
                 "全市場 development 研究包 v2。\n"
@@ -68,7 +69,7 @@ def install_strict_market_packager() -> None:
             for extra in (root / "symbol_strategy_summary.csv", root / "skipped_symbols.csv"):
                 if extra.exists():
                     z.write(extra, extra.name)
-            z.writestr("README_完整稽核包.txt", "包含 Locked Test。只可用於候選策略凍結後的最終稽核，不得根據 test 單筆結果再調策略。\n")
+            z.writestr("README_完整稽核包.txt", "包含 Locked Test 與全部逐筆交易。只可用於候選策略凍結後的最終稽核，不得根據 test 單筆結果再調策略。\n")
         return research, audit
 
     mb._write_packages = strict_write_packages
