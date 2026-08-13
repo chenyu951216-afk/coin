@@ -11,7 +11,7 @@ SIGNAL_SNAPSHOT_COLUMNS = (
     "ret_1", "ret_4", "ret_8",
     "atr_pct", "ema20_slope_atr4", "ema50_slope_atr8", "trend_strength_atr",
     "price_ema20_atr", "efficiency_8", "close_location", "range_atr", "volume_quote_z",
-    "breakout_up_20", "breakout_down_20",
+    "quote_volume_24h", "breakout_up_20", "breakout_down_20",
     "oi_chg_1", "oi_chg_4", "oi_z",
     "fund_z", "taker_imb", "taker_imb_z",
     "long_liq_z", "short_liq_z", "ls_z", "book_imb", "book_imb_z",
@@ -25,12 +25,7 @@ def estimated_round_trip_cost_r(
     fee_bps: float,
     slippage_bps: float,
 ) -> float:
-    """Conservative pre-trade estimate of fees + adverse entry/exit slippage in R.
-
-    Uses only information known before the trade is opened. The estimate assumes
-    roughly equal entry/exit notionals and therefore intentionally does not use
-    the future exit price.
-    """
+    """Conservative pre-trade fee + slippage estimate expressed in initial R."""
     distance = abs(float(entry) - float(stop))
     if distance <= 0 or not math.isfinite(distance) or entry <= 0:
         return math.inf
@@ -45,11 +40,7 @@ def cost_aware_breakeven_trigger(
     fee_bps: float,
     slippage_bps: float,
 ) -> float:
-    """Stop trigger that approximately covers exit slippage + both taker fees.
-
-    Entry slippage is already embedded in ``entry_fill``. Funding is excluded
-    because future funding settlements are unknown when the stop is moved.
-    """
+    """Stop trigger that approximately covers exit slippage + both taker fees."""
     fee = max(0.0, float(fee_bps)) / 10_000.0
     slip = max(0.0, float(slippage_bps)) / 10_000.0
     e = float(entry_fill)
