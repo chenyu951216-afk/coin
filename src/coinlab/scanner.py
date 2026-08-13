@@ -7,6 +7,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from .exchange import BitgetV2Client
+from .position_sizing import paper_notional_for_price, sizing_tier_for_price
 from .providers import BitgetPublicClient, CoinGlassClient
 from .research import SOURCE_LABELS, build_strategy_frame, source_status, strategy_requirements
 from .signal_quality import estimated_round_trip_cost_r
@@ -33,6 +34,9 @@ class ScanConfig:
     fee_bps: float = 6.0
     slippage_bps: float = 2.0
     max_estimated_cost_r: float = 0.18
+    paper_low_notional_usdt: float = 2_000.0
+    paper_high_notional_usdt: float = 20_000.0
+    paper_high_price_threshold: float = 50.0
 
 
 def _iso(ts: datetime) -> str:
@@ -49,11 +53,7 @@ def _closed_window(timeframe: str, bars: int) -> tuple[str, str]:
     return _iso(start), _iso(last_closed_open)
 
 
-def next_completed_bar_time(
-    timeframe: str,
-    now: datetime | None = None,
-    grace_seconds: int = 8,
-) -> str:
+def next_completed_bar_time(timeframe: str, now: datetime | None = None, grace_seconds: int = 8) -> str:
     minutes = _INTERVAL_MINUTES[timeframe]
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     minute_bucket = int(current.timestamp() // 60)
@@ -61,15 +61,10 @@ def next_completed_bar_time(
     return _iso(datetime.fromtimestamp(next_bucket * 60 + max(0, grace_seconds), tz=timezone.utc))
 
 
-def seconds_until_next_completed_bar(
-    timeframe: str,
-    now: datetime | None = None,
-    grace_seconds: int = 8,
-) -> float:
+def seconds_until_next_completed_bar(timeframe: str, now: datetime | None = None, grace_seconds: int = 8) -> float:
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     target = pd.Timestamp(next_completed_bar_time(timeframe, now=current, grace_seconds=grace_seconds))
-    current_ts = pd.Timestamp(current)
-    return max(1.0, float((target - current_ts).total_seconds()))
+    return max(1.0, float((target - pd.Timestamp(current)).total_seconds()))
 
 
 def derive_strategy_levels(df: pd.DataFrame, signal: StrategySignal, entry: float | None = None) -> dict[str, float]:
@@ -182,6 +177,13 @@ def scan_market(
             for source_name, method in _source_calls(cg).items():
                 if should_stop and should_stop():
                     break
+                # CoinGlass global account long/short does not support Bitget.
+                # Leave it unavailable instead of silently substituting another exchange.
+                if source_name == "ls" and cfg.coinglass_exchange.lower() == "bitget":
+                    datasets[source_name] = pd.DataFrame()
+                    source_diags[source_name] = {"status": "unsupported", "rows": 0, "reason": "CoinGlass Global L/S 不支援 Bitget"}
+                    source_fail_counts[source_name] += 1
+                    continue
                 try:
                     frame = method(**common)
                     datasets[source_name] = frame
@@ -226,14 +228,16 @@ def scan_market(
                     continue
                 levels = derive_strategy_levels(frame, signal)
                 estimated_cost_r = estimated_round_trip_cost_r(
-                    entry=levels["entry"],
-                    stop=levels["stop_loss"],
-                    fee_bps=cfg.fee_bps,
-                    slippage_bps=cfg.slippage_bps,
+                    entry=levels["entry"], stop=levels["stop_loss"],
+                    fee_bps=cfg.fee_bps, slippage_bps=cfg.slippage_bps,
                 )
                 if cfg.max_estimated_cost_r > 0 and estimated_cost_r > cfg.max_estimated_cost_r:
                     cost_rejected_signals += 1
                     continue
+                planned_notional = paper_notional_for_price(
+                    levels["entry"], low_notional=cfg.paper_low_notional_usdt,
+                    high_notional=cfg.paper_high_notional_usdt, threshold=cfg.paper_high_price_threshold,
+                )
                 symbol_matched = True
                 signal_time = str(frame.index[-1])
                 direction = "long" if signal.direction > 0 else "short"
@@ -245,6 +249,10 @@ def scan_market(
                     "stop_loss": levels["stop_loss"], "stop_pct": levels["stop_pct"],
                     "take_profit": levels["take_profit"], "take_profit_pct": levels["take_profit_pct"],
                     "reward_r": signal.reward_r, "estimated_cost_r": estimated_cost_r, "atr": levels["atr"],
+                    "planned_notional_usdt": planned_notional,
+                    "sizing_tier": sizing_tier_for_price(levels["entry"], threshold=cfg.paper_high_price_threshold),
+                    "planned_stop_loss_usdt": planned_notional * levels["stop_pct"],
+                    "planned_take_profit_gross_usdt": planned_notional * levels["take_profit_pct"],
                     "volume_24h_usdt": candidate.get("volume_24h_usdt"), "spread_pct": candidate.get("spread_pct"),
                     "coinglass_exchange": cfg.coinglass_exchange, "coinglass_instrument": cg_symbol,
                     "aligned_rows": len(frame), "data_window_start": diagnostic.get("common_start"),
