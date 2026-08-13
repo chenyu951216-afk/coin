@@ -10,6 +10,16 @@ def zscore(s: pd.Series, window: int = 96) -> pd.Series:
     return (s - mean) / std
 
 
+def _bars_for_24h(index: pd.DatetimeIndex) -> int | None:
+    if len(index) < 3:
+        return None
+    deltas = pd.Series(index[1:] - index[:-1]).dt.total_seconds()
+    seconds = float(deltas.median()) if len(deltas) else 0.0
+    if not np.isfinite(seconds) or seconds <= 0:
+        return None
+    return max(1, int(round(86_400.0 / seconds)))
+
+
 def build_feature_frame(
     price: pd.DataFrame,
     oi: pd.DataFrame,
@@ -35,7 +45,8 @@ def build_feature_frame(
                 x[c] = pd.to_numeric(x[c], errors="coerce")
             frames.append(x)
 
-    # Strict timestamp intersection: no forward-filling future/late derivative observations.
+    # Strict timestamp intersection: never forward-fill a derivative observation
+    # from a later timestamp into an earlier completed candle.
     df = pd.concat(frames, axis=1, join="inner").sort_index()
     if df.empty:
         return df
@@ -73,7 +84,14 @@ def build_feature_frame(
     df["breakout_down_20"] = (df["close"] < prior_low).astype(float)
 
     if "volume_quote" in df.columns:
-        df["volume_quote_z"] = zscore(np.log1p(df["volume_quote"].clip(lower=0)))
+        quote = pd.to_numeric(df["volume_quote"], errors="coerce").clip(lower=0)
+        df["volume_quote_z"] = zscore(np.log1p(quote))
+        bars24 = _bars_for_24h(df.index)
+        if bars24:
+            # At signal close t, every bar in this rolling sum is already closed.
+            # This is the historical liquidity filter used by market-wide backtests;
+            # current-day ticker turnover is never used to decide a past trade.
+            df["quote_volume_24h"] = quote.rolling(bars24, min_periods=bars24).sum()
 
     if "oi_close" in df:
         df["oi_chg_1"] = df["oi_close"].pct_change()
